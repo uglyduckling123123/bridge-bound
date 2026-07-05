@@ -17,6 +17,31 @@ type Player = {
   controls: { left: string; right: string; jump: string };
 };
 
+// Tile constants — the whole world is data-driven from here.
+const TILE = 32;
+const COLS = 30; // 30 * 32 = 960
+const ROWS = 17; // 17 * 32 = 544 (canvas 540 rounded up; last row hidden in void)
+
+// Tile types
+const AIR = 0;
+const BLOCK = 1;
+
+function buildInitialGrid(): number[][] {
+  const grid: number[][] = [];
+  for (let r = 0; r < ROWS; r++) {
+    grid.push(new Array(COLS).fill(AIR));
+  }
+  // Bridge: a single row of blocks perfectly aligned to the grid.
+  // Row 10 (y = 320). Starts at col 1, ends at col 26 — 26 whole blocks.
+  const bridgeRow = 10;
+  const bridgeStartCol = 1;
+  const bridgeEndCol = 26; // inclusive
+  for (let c = bridgeStartCol; c <= bridgeEndCol; c++) {
+    grid[bridgeRow][c] = BLOCK;
+  }
+  return grid;
+}
+
 function Index() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -35,18 +60,19 @@ function Index() {
     const MOVE_SPEED = 4;
     const JUMP_V = 12;
 
-    // Bridge dimensions
-    const bridge = {
-      x: 80,
-      y: H / 2 + 40,
-      w: W - 160,
-      h: 20,
+    const grid = buildInitialGrid();
+
+    const isSolid = (col: number, row: number): boolean => {
+      if (row < 0 || row >= ROWS || col < 0 || col >= COLS) return false;
+      return grid[row][col] === BLOCK;
     };
 
+    // Spawn players standing on the bridge row (y = 10*32 = 320).
+    const bridgeTopY = 10 * TILE;
     const players: Player[] = [
       {
-        x: bridge.x + 60,
-        y: bridge.y - 40,
+        x: 3 * TILE,
+        y: bridgeTopY - 40,
         vx: 0,
         vy: 0,
         w: 28,
@@ -56,8 +82,8 @@ function Index() {
         controls: { left: "a", right: "d", jump: "w" },
       },
       {
-        x: bridge.x + bridge.w - 90,
-        y: bridge.y - 40,
+        x: 24 * TILE,
+        y: bridgeTopY - 40,
         vx: 0,
         vy: 0,
         w: 28,
@@ -72,7 +98,6 @@ function Index() {
     const onDown = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase();
       keys.add(k);
-      // Prevent page scroll on arrows/space
       if (k.startsWith("arrow") || k === " ") e.preventDefault();
       for (const p of players) {
         if (k === p.controls.jump && p.onGround) {
@@ -85,6 +110,60 @@ function Index() {
     window.addEventListener("keydown", onDown);
     window.addEventListener("keyup", onUp);
 
+    // Axis-separated tile collision: move X, resolve; move Y, resolve.
+    const moveAxis = (p: Player, dx: number, dy: number) => {
+      // X
+      p.x += dx;
+      if (dx !== 0) {
+        const rowTop = Math.floor(p.y / TILE);
+        const rowBot = Math.floor((p.y + p.h - 1) / TILE);
+        if (dx > 0) {
+          const col = Math.floor((p.x + p.w - 1) / TILE);
+          for (let r = rowTop; r <= rowBot; r++) {
+            if (isSolid(col, r)) {
+              p.x = col * TILE - p.w;
+              break;
+            }
+          }
+        } else {
+          const col = Math.floor(p.x / TILE);
+          for (let r = rowTop; r <= rowBot; r++) {
+            if (isSolid(col, r)) {
+              p.x = (col + 1) * TILE;
+              break;
+            }
+          }
+        }
+      }
+      // Y
+      p.y += dy;
+      p.onGround = false;
+      if (dy !== 0) {
+        const colLeft = Math.floor(p.x / TILE);
+        const colRight = Math.floor((p.x + p.w - 1) / TILE);
+        if (dy > 0) {
+          const row = Math.floor((p.y + p.h - 1) / TILE);
+          for (let c = colLeft; c <= colRight; c++) {
+            if (isSolid(c, row)) {
+              p.y = row * TILE - p.h;
+              p.vy = 0;
+              p.onGround = true;
+              break;
+            }
+          }
+        } else {
+          const row = Math.floor(p.y / TILE);
+          for (let c = colLeft; c <= colRight; c++) {
+            if (isSolid(c, row)) {
+              p.y = (row + 1) * TILE;
+              p.vy = 0;
+              break;
+            }
+          }
+        }
+      }
+    };
+
     let raf = 0;
     const loop = () => {
       // Update
@@ -92,38 +171,22 @@ function Index() {
         p.vx = 0;
         if (keys.has(p.controls.left)) p.vx = -MOVE_SPEED;
         if (keys.has(p.controls.right)) p.vx = MOVE_SPEED;
-
         p.vy += GRAVITY;
-        p.x += p.vx;
-        p.y += p.vy;
+        if (p.vy > 20) p.vy = 20;
 
-        // Bridge collision (land on top only when falling)
-        const onBridgeX = p.x + p.w > bridge.x && p.x < bridge.x + bridge.w;
-        const feet = p.y + p.h;
-        if (
-          onBridgeX &&
-          p.vy >= 0 &&
-          feet >= bridge.y &&
-          feet - p.vy <= bridge.y + 1
-        ) {
-          p.y = bridge.y - p.h;
-          p.vy = 0;
-          p.onGround = true;
-        } else {
-          p.onGround = false;
-        }
+        moveAxis(p, p.vx, 0);
+        moveAxis(p, 0, p.vy);
 
         // Respawn if fallen into the void
         if (p.y > H + 200) {
-          p.x = bridge.x + bridge.w / 2;
-          p.y = bridge.y - 100;
+          p.x = (COLS / 2) * TILE;
+          p.y = bridgeTopY - 120;
           p.vx = 0;
           p.vy = 0;
         }
       }
 
-      // Draw
-      // Sky gradient
+      // Draw — background unchanged
       const grad = ctx.createLinearGradient(0, 0, 0, H);
       grad.addColorStop(0, "#0f172a");
       grad.addColorStop(1, "#1e293b");
@@ -138,31 +201,35 @@ function Index() {
         ctx.fillRect(sx, sy, 2, 2);
       }
 
-      // Void
+      // Void band below the bridge row
       ctx.fillStyle = "#000";
-      ctx.fillRect(0, bridge.y + bridge.h + 40, W, H);
+      ctx.fillRect(0, (10 + 1) * TILE + 8, W, H);
 
-      // Bridge
-      ctx.fillStyle = "#78716c";
-      ctx.fillRect(bridge.x, bridge.y, bridge.w, bridge.h);
-      ctx.fillStyle = "#57534e";
-      ctx.fillRect(bridge.x, bridge.y + bridge.h - 4, bridge.w, 4);
-
-      // Bridge planks
-      ctx.strokeStyle = "#44403c";
-      ctx.lineWidth = 1;
-      for (let i = 0; i < bridge.w; i += 24) {
-        ctx.beginPath();
-        ctx.moveTo(bridge.x + i, bridge.y);
-        ctx.lineTo(bridge.x + i, bridge.y + bridge.h);
-        ctx.stroke();
+      // Tiles
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+          if (grid[r][c] !== BLOCK) continue;
+          const x = c * TILE;
+          const y = r * TILE;
+          ctx.fillStyle = "#78716c";
+          ctx.fillRect(x, y, TILE, TILE);
+          // Top highlight
+          ctx.fillStyle = "#a8a29e";
+          ctx.fillRect(x, y, TILE, 3);
+          // Bottom shadow
+          ctx.fillStyle = "#57534e";
+          ctx.fillRect(x, y + TILE - 4, TILE, 4);
+          // Seam
+          ctx.strokeStyle = "#44403c";
+          ctx.lineWidth = 1;
+          ctx.strokeRect(x + 0.5, y + 0.5, TILE - 1, TILE - 1);
+        }
       }
 
       // Players
       for (const p of players) {
         ctx.fillStyle = p.color;
         ctx.fillRect(p.x, p.y, p.w, p.h);
-        // Eyes
         ctx.fillStyle = "#fff";
         ctx.fillRect(p.x + 6, p.y + 10, 5, 5);
         ctx.fillRect(p.x + 17, p.y + 10, 5, 5);
