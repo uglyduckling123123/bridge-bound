@@ -38,22 +38,31 @@ const MAX_ARROWS = 6;
 const MAX_GAPPLE = 1;
 const WIN_SCORE = 5;
 const MAX_HP = 4;
+const ARROW_DAMAGE = 1;
 
 const SWING_DURATION = 200; // 0.2s visual arc
 const SWING_COOLDOWN = 380;
 const SWING_RADIUS = 3 * TILE; // 3-block radius arc
-const KNOCKBACK_VX = 12.5; // Buffed by 25% from 10 for punchier hits
-const KNOCKBACK_POP_VY = -7; // mandatory lift so victim doesn't stick on floor
+// Knockback at 75% of original values for tighter combat
+const KNOCKBACK_VX = 9.375; // 75% of 12.5
+const KNOCKBACK_POP_VY = -5.25; // 75% of -7
 
 const GRAVITY = 0.5;
 const JUMP_HEIGHT_TILES = 1.8;
 // Kinematic jump velocity: v0 = sqrt(2 * g * h)  (h in pixels)
 const JUMP_V = Math.sqrt(2 * GRAVITY * (JUMP_HEIGHT_TILES * TILE));
-// Velocity-based movement: acceleration + terminal cap
+// Velocity-based movement: 66% of original terminal
 const MOVE_ACCEL = 0.4;
-const MOVE_TERMINAL = 4.5;
+const MOVE_TERMINAL = 2.97; // 66% of 4.5
 const FRICTION = 0.85; // applied when no input
 const KNOCKBACK_OVERRIDE_FRAMES = 8; // knockback overrides input for this many frames
+
+// Cooldowns
+const PLACE_COOLDOWN_MS = 200;
+const BREAK_COOLDOWN_MS = 300;
+const STUCK_TIMEOUT_MS = 1000;
+const COMBAT_RANGE_TILES = 8;
+const COMBAT_RESET_MS = 3000;
 
 const FALL_TERMINAL = 18;
 const FALL_TERMINAL_FLOATY = FALL_TERMINAL * 0.8; // 20% slower once past the peak
@@ -96,6 +105,8 @@ type Player = {
   gappleCount: number;
   gappleEatingUntil: number; // timestamp when eating animation ends
   knockbackFrames: number; // remaining frames of knockback override
+  lastPlaceTime: number;
+  lastBreakTime: number;
   swingUntil: number;
   swingReadyAt: number;
   spawn: { x: number; y: number };
@@ -193,6 +204,7 @@ function Index() {
       color, name, facing, onGround: false,
       blocksLeft: MAX_BLOCKS, arrows: MAX_ARROWS, hp: MAX_HP,
       gappleCount: MAX_GAPPLE, gappleEatingUntil: 0, knockbackFrames: 0,
+      lastPlaceTime: 0, lastBreakTime: 0,
       swingUntil: 0, swingReadyAt: 0, spawn, controls,
       aiming: false, aimStart: 0, aimAngleFixed: Math.PI / 4,
       placedTile: name === "Red" ? PLACED_RED : PLACED_BLUE,
@@ -224,6 +236,9 @@ function Index() {
       p.gappleCount = MAX_GAPPLE; p.gappleEatingUntil = 0;
       p.knockbackFrames = 0;
       p.swingUntil = 0; p.aiming = false;
+      p.lastPlaceTime = 0; p.lastBreakTime = 0;
+      // Reset bot arrow debouncer when bot dies
+      if (p.id === 1) bot.hasFiredArrowThisFight = false;
     };
 
     const respawnAll = () => {
@@ -314,18 +329,18 @@ function Index() {
       return true;
     };
 
-    const placeFront = (p: Player) => {
+    const placeFront = (p: Player, nowMs: number) => {
       const f1 = frontTile(p, 1);
-      if (placeAt(p, f1.col, f1.row)) return;
+      if (safePlace(p, f1.col, f1.row, nowMs)) return;
       const f2 = frontTile(p, 2);
-      placeAt(p, f2.col, f2.row);
+      safePlace(p, f2.col, f2.row, nowMs);
     };
 
-    const breakFront = (p: Player) => {
+    const breakFront = (p: Player, nowMs: number) => {
       const f1 = frontTile(p, 1);
-      if (breakAt(p, f1.col, f1.row)) return;
+      if (safeBreak(p, f1.col, f1.row, nowMs)) return;
       const f2 = frontTile(p, 2);
-      breakAt(p, f2.col, f2.row);
+      safeBreak(p, f2.col, f2.row, nowMs);
     };
 
     // Instant, vector-based hit detection — runs the frame the key is pressed.
@@ -389,9 +404,10 @@ function Index() {
       e.preventDefault();
       const { col, row } = mouseTile();
       if (!inRedRange(col, row)) return;
+      const nowMs = performance.now();
       const red = players[0];
-      if (e.button === 0) placeAt(red, col, row);
-      else if (e.button === 2) breakAt(red, col, row);
+      if (e.button === 0) safePlace(red, col, row, nowMs);
+      else if (e.button === 2) safeBreak(red, col, row, nowMs);
     };
     const onCtx = (e: MouseEvent) => e.preventDefault();
     canvas.addEventListener("mousemove", onMove);
@@ -512,6 +528,7 @@ function Index() {
     // State machine per spec: A=VOID_RECOVERY, B=PILLAR, C=INTERCEPT, D=RACE, E=COMBAT
     enum BotState {
       VOID_RECOVERY = "VOID_RECOVERY",
+      STAIRCASE = "STAIRCASE",
       PILLAR = "PILLAR",
       INTERCEPT = "INTERCEPT",
       RACE = "RACE",
@@ -525,7 +542,11 @@ function Index() {
       nextShotAt: 0,
       prevVy: 0,
       pillarJumpArmed: false,
-      jumpAttemptStart: 0, // timestamp for jump timeout tracking
+      jumpAttemptStart: 0,
+      hasFiredArrowThisFight: false,
+      lastCombatContact: 0,
+      staircaseStep: 0, // tracks which step of staircase we're on
+      obstacleAttemptStart: 0, // timeout for jump/pillar attempts
       // Delayed perception exposed to executors:
       delayedRedX: 0,
       delayedRedY: 0,
@@ -541,42 +562,91 @@ function Index() {
     // Helper: check if a tile is a placed block (used for block recovery on break)
     const isPlacedTile = (t: number) => t === PLACED_RED || t === PLACED_BLUE;
 
-    // State evaluation (called every 0.5s) — returns state based on spec priority B→C→D→E
+    // State evaluation (called every 0.5s) — returns state based on spec priority
     // STATE A (VOID_RECOVERY) is evaluated every frame BEFORE this is called
     const evaluateState = (nowMs: number): BotState => {
       const me = players[1];
-      const { delayedRedX, delayedRedY, delayedGrid } = bot;
+      const { delayedRedX, delayedRedY } = bot;
 
       // Metrics per spec
       const botDistToTarget = Math.abs(me.x - RED_GOAL_X);
       const redDistToTarget = Math.abs(delayedRedX - BLUE_GOAL_X);
-
-      // STATE B: VERTICAL PILLARING / ELEVATION MATCHING
-      // Red is significantly higher and within short horizontal range
+      const horizDistToRed = Math.abs(delayedRedX - me.x);
       const heightDiff = me.y - delayedRedY; // positive = red is higher (y grows downward)
-      const horizProxToRed = Math.abs(delayedRedX - me.x);
-      if (heightDiff > TILE * 1.5 && horizProxToRed < TILE * 3) {
-        return BotState.PILLAR;
+
+      // Vertical approach: Staircase vs Pillar based on distance
+      if (heightDiff > TILE * 1.5 && bot.currentState !== BotState.RACE) {
+        // STAIRCASE MODE: Far range (> 4 blocks horizontal)
+        if (horizDistToRed > TILE * 4) {
+          return BotState.STAIRCASE;
+        }
+        // PILLAR MODE: Close range (<= 4 blocks horizontal)
+        if (horizDistToRed <= TILE * 4) {
+          return BotState.PILLAR;
+        }
       }
 
-      // STATE C: INTERCEPT & ENGAGE MODE
-      // Opponent is closer to scoring than bot → charge toward delayedRedX
+      // INTERCEPT & ENGAGE MODE: Opponent closer to scoring
       if (redDistToTarget < botDistToTarget - TILE * 0.5) {
         return BotState.INTERCEPT;
       }
 
-      // STATE D: RACING MODE
-      // Bot is at least 3 blocks closer to goal → sprint toward Red Goal
+      // RACING MODE: Bot at least 3 blocks closer to goal
       const RACE_THRESHOLD = TILE * 3;
       if (botDistToTarget < redDistToTarget - RACE_THRESHOLD) {
         return BotState.RACE;
       }
 
-      // STATE E: COMBAT MODE (default fallback)
-      // Handle ranged/melee combat, obstacle clearing
+      // COMBAT MODE: Default fallback
       return BotState.COMBAT;
       void nowMs;
-      void delayedGrid;
+    };
+
+    // Safe grid lookup with bounds check
+    const safeGetTile = (col: number, row: number): number | null => {
+      if (col < 0 || col >= COLS || row < 0 || row >= ROWS) return null;
+      return grid[row][col];
+    };
+
+    // Check ceiling above obstacle (2 and 3 blocks up)
+    const hasCeiling = (col: number, baseRow: number): boolean => {
+      for (let h = 2; h <= 3; h++) {
+        const tile = safeGetTile(col, baseRow - h);
+        if (tile !== null && tile !== AIR) return true;
+      }
+      return false;
+    };
+
+    // Count consecutive solid blocks in direction
+    const countWallThickness = (startCol: number, row: number, dir: 1 | -1): number => {
+      let count = 0;
+      let c = startCol;
+      while (c >= 0 && c < COLS) {
+        const tile = safeGetTile(c, row);
+        if (tile !== null && tile !== AIR) {
+          count++;
+          c += dir;
+        } else break;
+      }
+      return count;
+    };
+
+    // Safe place with cooldown
+    const safePlace = (p: Player, col: number, row: number, nowMs: number): boolean => {
+      if (nowMs - p.lastPlaceTime < PLACE_COOLDOWN_MS) return false;
+      if (col < 0 || col >= COLS || row < 0 || row >= ROWS) return false;
+      if (!placeAt(p, col, row)) return false;
+      p.lastPlaceTime = nowMs;
+      return true;
+    };
+
+    // Safe break with cooldown
+    const safeBreak = (p: Player, col: number, row: number, nowMs: number): boolean => {
+      if (nowMs - p.lastBreakTime < BREAK_COOLDOWN_MS) return false;
+      if (col < 0 || col >= COLS || row < 0 || row >= ROWS) return false;
+      if (!breakAt(p, col, row)) return false;
+      p.lastBreakTime = nowMs;
+      return true;
     };
 
     // ---- executors: run every frame for fluid movement ----
@@ -596,12 +666,12 @@ function Index() {
         me.vx -= MOVE_ACCEL;
         me.facing = -1;
       }
-      // Terminal cap
+      // Terminal cap (66% of original)
       if (me.vx > MOVE_TERMINAL) me.vx = MOVE_TERMINAL;
       if (me.vx < -MOVE_TERMINAL) me.vx = -MOVE_TERMINAL;
     };
 
-    // Smart obstacle handling: 1 block per frame, immediate return after action
+    // Smart obstacle handling with ceiling/wall checks, 1 block per frame, immediate return
     const clearForwardObstacles = (nowMs: number) => {
       const me = players[1];
       const dir = me.facing;
@@ -615,45 +685,50 @@ function Index() {
       const headBlocked = isSolid(aheadCol, headRow);
       const bodyBlocked = isSolid(aheadCol, feetRow);
 
-      // Blocked by wall - check if jumpable (no loop, single check for 2-block clearance)
+      // Blocked by wall
       if ((headBlocked || bodyBlocked) && me.onGround) {
-        // Quick jump check: if head NOT blocked and 2 rows above both clear, jump
-        const rowAboveHead = headRow - 1;
-        const rowTwoAbove = headRow - 2;
-        const canJumpOver = !headBlocked &&
-          rowAboveHead >= 0 && rowTwoAbove >= 0 &&
-          !isSolid(aheadCol, rowAboveHead) && !isSolid(aheadCol, rowTwoAbove);
+        // Ceiling check: 2 and 3 blocks above
+        const ceilingBlocked = hasCeiling(aheadCol, headRow);
+        // Wall thickness check
+        const wallThickness = countWallThickness(aheadCol, feetRow, dir);
 
-        // Check if we're stuck (1.5s timeout)
-        const stuckTooLong = nowMs >= bot.jumpAttemptStart + 1500;
+        // Can jump if: no ceiling AND wall > 3 blocks AND head not blocked
+        const canJumpOver = !ceilingBlocked && !headBlocked && wallThickness > 3;
+
+        // 1-second timeout for jump attempts
+        const stuckTooLong = bot.obstacleAttemptStart > 0 && nowMs - bot.obstacleAttemptStart >= STUCK_TIMEOUT_MS;
+
         if (canJumpOver && !stuckTooLong) {
-          if (!bot.jumpAttemptStart) bot.jumpAttemptStart = nowMs;
-          // Execute forward jump
+          if (!bot.obstacleAttemptStart) bot.obstacleAttemptStart = nowMs;
+          // Execute jump
           me.vy = -JUMP_V;
           me.onGround = false;
-          if (dir > 0) me.vx = Math.max(me.vx, MOVE_SPEED);
-          else me.vx = Math.min(me.vx, -MOVE_SPEED);
-          bot.jumpAttemptStart = 0;
+          me.vx = dir * MOVE_SPEED;
           return { cleared: false, bridged: false, jumping: true };
         }
-        // Timeout or can't jump - mine ONE block, return immediately
-        if (nowMs >= bot.nextActionAt) {
-          // Priority: head block first, then body block (single action per frame)
+
+        // Mining fallback: wall <= 3 blocks thick, single block per frame
+        if (wallThickness <= 3 && nowMs >= bot.nextActionAt) {
           if (headBlocked) {
-            breakAt(me, aheadCol, headRow);
+            if (safeBreak(me, aheadCol, headRow, nowMs)) {
+              bot.nextActionAt = nowMs + 180;
+              bot.obstacleAttemptStart = 0;
+              return { cleared: true, bridged: false, jumping: false };
+            }
           } else if (bodyBlocked) {
-            breakAt(me, aheadCol, feetRow);
+            if (safeBreak(me, aheadCol, feetRow, nowMs)) {
+              bot.nextActionAt = nowMs + 180;
+              bot.obstacleAttemptStart = 0;
+              return { cleared: true, bridged: false, jumping: false };
+            }
           }
-          bot.nextActionAt = nowMs + 180;
-          bot.jumpAttemptStart = 0;
-          return { cleared: true, bridged: false, jumping: false };
         }
       }
 
-      // Smart bridging: void ahead → place block, return immediately
+      // Smart bridging: void ahead
       if (!groundAhead && me.onGround && me.blocksLeft > 0 && nowMs >= bot.nextActionAt) {
         me.vx = 0;
-        if (placeAt(me, aheadCol, feetRow + 1)) {
+        if (safePlace(me, aheadCol, feetRow + 1, nowMs)) {
           bot.nextActionAt = nowMs + 180;
           return { cleared: false, bridged: true, jumping: false };
         }
@@ -661,111 +736,151 @@ function Index() {
       return { cleared: false, bridged: false, jumping: false };
     };
 
-    // STATE A executor — single action per frame, no loops
+    // STATE A: Void recovery - single action per frame
     const tryVoidRecovery = (nowMs: number): boolean => {
       const me = players[1];
       const belowBridge = me.y > BRIDGE_Y + TILE * 0.5;
       const falling = me.vy > 0;
       if (!(belowBridge && falling)) return false;
-      // Push toward bridge row direction based on current column (no scan loop)
       const myCol = Math.floor((me.x + me.w / 2) / TILE);
       const centerCol = Math.floor(COLS / 2);
       const towardCenter = myCol < centerCol ? 1 : -1;
       me.vx = MOVE_SPEED * towardCenter;
       me.facing = towardCenter as 1 | -1;
-      // Place platform directly beneath feet - single action per frame
       if (me.blocksLeft > 0 && nowMs >= bot.nextActionAt) {
         const col = Math.floor((me.x + me.w / 2) / TILE);
         const row = Math.floor((me.y + me.h) / TILE);
-        if (placeAt(me, col, row)) {
+        if (safePlace(me, col, row, nowMs)) {
           bot.nextActionAt = nowMs + 150;
         }
       }
       return true;
     };
 
-    // STATE B executor: Pillar upward to match opponent's height
+    // STATE B1: Staircase mode - diagonal path upward
+    const executeStaircase = (nowMs: number) => {
+      const me = players[1];
+      const dir = me.facing;
+      const cx = Math.floor((me.x + me.w / 2) / TILE);
+      const feetRow = Math.floor((me.y + me.h - 1) / TILE);
+      const aheadCol = cx + dir;
+
+      // Step 1: Place block at foot level ahead
+      if (bot.staircaseStep === 0 && me.blocksLeft > 0) {
+        const tileAhead = safeGetTile(aheadCol, feetRow);
+        if (tileAhead === AIR && safePlace(me, aheadCol, feetRow, nowMs)) {
+          bot.staircaseStep = 1;
+          return;
+        }
+      }
+      // Step 2: Step onto it (jump) and place one level up ahead
+      if (bot.staircaseStep === 1 && me.onGround) {
+        me.vy = -JUMP_V;
+        me.onGround = false;
+        me.vx = dir * MOVE_SPEED;
+        bot.staircaseStep = 2;
+        return;
+      }
+      if (bot.staircaseStep === 2 && me.onGround && me.blocksLeft > 0) {
+        const upRow = feetRow - 1;
+        if (safePlace(me, aheadCol, upRow, nowMs)) {
+          bot.staircaseStep = 0;
+          return;
+        }
+      }
+    };
+
+    // STATE B2: Pillar mode - vertical ascent, kill horizontal momentum
     const executePillar = (nowMs: number) => {
       const me = players[1];
-      // Stay roughly in place horizontally
-      me.vx = 0;
+      me.vx = 0; // Kill horizontal momentum
 
-      // If grounded, trigger jump
       if (me.onGround) {
         me.vy = -JUMP_V;
         me.onGround = false;
         bot.pillarJumpArmed = true;
       }
 
-      // At the exact peak of jump (vy transitions from negative toward >= 0),
-      // place block directly beneath feet to build tower
       const atPeak = bot.pillarJumpArmed && bot.prevVy < 0 && me.vy >= -0.2;
-      if (atPeak && me.blocksLeft > 0 && nowMs >= bot.nextActionAt) {
+      if (atPeak && me.blocksLeft > 0) {
         const col = Math.floor((me.x + me.w / 2) / TILE);
-        // Place block at row below feet (we're in the air, so this is where we jumped from)
         const row = Math.floor((me.y + me.h) / TILE);
-        if (placeAt(me, col, row)) {
-          bot.nextActionAt = nowMs + 200;
+        if (safePlace(me, col, row, nowMs)) {
+          bot.pillarJumpArmed = false;
         }
-        bot.pillarJumpArmed = false;
       }
     };
 
-    // STATE C executor: Intercept — charge toward delayedRedX for close-quarters combat
+    // STATE C: Intercept - charge toward delayedRedX
     const executeIntercept = (nowMs: number) => {
       const me = players[1];
       const foe = players[0];
-
-      // Face and move toward delayed opponent position
       const horizDelayed = bot.delayedRedX - me.x;
       me.facing = horizDelayed >= 0 ? 1 : -1;
       moveTowards(bot.delayedRedX);
       clearForwardObstacles(nowMs);
-
-      // Melee attack (use live foe position for actual hit detection)
       const meleeDist = TILE * 1.2;
       if (Math.abs(foe.x - me.x) < meleeDist && Math.abs(foe.y - me.y) < TILE * 1.4) {
         attack(me);
       }
     };
 
-    // STATE D executor: Racing — sprint toward Red Goal, clear obstacles, bridge gaps
+    // STATE D: Racing - sprint toward Red Goal
     const executeRace = (nowMs: number) => {
       const me = players[1];
-
-      // Face toward Red Goal
       me.facing = me.x < RED_GOAL_X ? 1 : -1;
       moveTowards(RED_GOAL_X);
       clearForwardObstacles(nowMs);
     };
 
-    // STATE E executor: Combat — ranged/melee attacks while maintaining forward movement
+    // STATE E: Combat with arrow mix-up
     const executeCombat = (nowMs: number) => {
       const me = players[1];
       const foe = players[0];
-      const horizDelayed = bot.delayedRedX - me.x;
+      const horizDist = Math.abs(foe.x - me.x);
+      me.facing = foe.x >= me.x ? 1 : -1;
 
-      // Face opponent
-      me.facing = horizDelayed >= 0 ? 1 : -1;
-
-      // Ranged: if long-range, Y-aligned, have arrows → fire with upward compensation
-      const yAligned = Math.abs(bot.delayedRedY - me.y) < TILE * 1.5;
-      const longRange = Math.abs(horizDelayed) > TILE * 4;
-      if (yAligned && longRange && me.arrows > 0 && nowMs >= bot.nextShotAt) {
-        const dist = Math.abs(horizDelayed);
-        const comp = Math.min(0.5, 0.05 + dist / (TILE * 40));
-        fireArrow(me, comp);
-        bot.nextShotAt = nowMs + 850;
+      // Track combat contact
+      const inCombatRange = horizDist < COMBAT_RANGE_TILES * TILE;
+      if (inCombatRange) {
+        bot.lastCombatContact = nowMs;
+      } else if (nowMs - bot.lastCombatContact > COMBAT_RESET_MS) {
+        bot.hasFiredArrowThisFight = false;
       }
 
-      // Melee: if close range, continuously attack
+      // 1-Tap: if player at arrow kill threshold, fire immediately
+      if (foe.hp <= ARROW_DAMAGE && me.arrows > 0 && nowMs >= bot.nextShotAt) {
+        const yAligned = Math.abs(foe.y - me.y) < TILE * 1.5;
+        if (yAligned) {
+          me.facing = foe.x >= me.x ? 1 : -1;
+          fireArrow(me, 0.3);
+          bot.nextShotAt = nowMs + 850;
+          return;
+        }
+      }
+
+      // Mix-up: 50/50 chance to fire arrow at 1-2 block range
+      const inMixupRange = horizDist > TILE && horizDist <= TILE * 2;
+      if (inMixupRange && !bot.hasFiredArrowThisFight && me.arrows > 0 && nowMs >= bot.nextShotAt) {
+        if (Math.random() < 0.5) {
+          const yAligned = Math.abs(foe.y - me.y) < TILE * 1.5;
+          if (yAligned) {
+            me.facing = foe.x >= me.x ? 1 : -1;
+            fireArrow(me, 0.35);
+            bot.nextShotAt = nowMs + 850;
+            bot.hasFiredArrowThisFight = true;
+            return;
+          }
+        }
+      }
+
+      // Melee
       const meleeDist = TILE * 1.2;
-      if (Math.abs(foe.x - me.x) < meleeDist && Math.abs(foe.y - me.y) < TILE * 1.4) {
+      if (horizDist < meleeDist && Math.abs(foe.y - me.y) < TILE * 1.4) {
         attack(me);
       }
 
-      // Clear obstacles while maintaining forward momentum
-      moveTowards(bot.delayedRedX);
+      moveTowards(foe.x);
       clearForwardObstacles(nowMs);
     };
 
@@ -778,27 +893,27 @@ function Index() {
       bot.delayedRedY = delayedRedY;
       bot.delayedGrid = delayedGrid;
 
-      // STATE A: VOID RECOVERY — evaluated every frame (bypasses 0.5s timer for safety)
-      // Per spec: If bot is below bridge level and falling, instantly place block beneath feet
+      // STATE A: VOID RECOVERY — every frame, bypasses 0.5s timer
       if (tryVoidRecovery(nowMs)) {
         bot.currentState = BotState.VOID_RECOVERY;
         bot.prevVy = me.vy;
         return;
       }
 
-      // Evaluate remaining states on a 0.5s cadence to avoid jitter
+      // Evaluate remaining states on 0.5s cadence
       if (nowMs >= bot.nextEvalAt) {
         bot.currentState = evaluateState(nowMs);
         bot.nextEvalAt = nowMs + EVAL_INTERVAL;
       }
 
-      // Execute the chosen state every frame for fluid, responsive behavior
+      // Execute chosen state every frame for fluid behavior
       switch (bot.currentState) {
-        case BotState.PILLAR:    executePillar(nowMs); break;    // STATE B
-        case BotState.INTERCEPT: executeIntercept(nowMs); break; // STATE C
-        case BotState.RACE:      executeRace(nowMs); break;      // STATE D
+        case BotState.STAIRCASE:  executeStaircase(nowMs); break;
+        case BotState.PILLAR:     executePillar(nowMs); break;
+        case BotState.INTERCEPT:  executeIntercept(nowMs); break;
+        case BotState.RACE:       executeRace(nowMs); break;
         case BotState.COMBAT:
-        default:                 executeCombat(nowMs); break;    // STATE E
+        default:                  executeCombat(nowMs); break;
       }
 
       bot.prevVy = me.vy;
@@ -843,8 +958,8 @@ function Index() {
             if (justPressed.has(ak)) { attack(p); break; }
           }
           if (p.id === 1) {
-            if (justPressed.has(p.controls.place)) placeFront(p);
-            if (justPressed.has(p.controls.breakBlock)) breakFront(p);
+            if (justPressed.has(p.controls.place)) placeFront(p, now);
+            if (justPressed.has(p.controls.breakBlock)) breakFront(p, now);
           }
           for (const bk of p.controls.bow) {
             if (justPressed.has(bk) && !p.aiming && p.arrows > 0) {
