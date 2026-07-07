@@ -31,15 +31,20 @@ const MAX_ARROWS = 6;
 const WIN_SCORE = 5;
 const MAX_HP = 4;
 
-const SWING_DURATION = 180;
+const SWING_DURATION = 200; // 0.2s visual arc
 const SWING_COOLDOWN = 380;
-const SWING_REACH = 44;
+const SWING_RADIUS = 3 * TILE; // 3-block radius arc
 const KNOCKBACK_VX = 10;
-const KNOCKBACK_VY = -6;
+const KNOCKBACK_POP_VY = -7; // mandatory lift so victim doesn't stick on floor
 
 const GRAVITY = 0.5;
-const JUMP_V = 6.2;
+const JUMP_HEIGHT_TILES = 1.8;
+// Kinematic jump velocity: v0 = sqrt(2 * g * h)  (h in pixels)
+const JUMP_V = Math.sqrt(2 * GRAVITY * (JUMP_HEIGHT_TILES * TILE));
 const MOVE_SPEED = 3.2;
+
+const FALL_TERMINAL = 18;
+const FALL_TERMINAL_FLOATY = FALL_TERMINAL * 0.8; // 20% slower once past the peak
 
 const AIM_PERIOD_MS = 2000;
 const ARROW_SPEED = 11;
