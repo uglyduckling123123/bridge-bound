@@ -654,13 +654,42 @@ function Index() {
         }
       }
 
+      // Sword swing visual arc: sweeps from 180° behind the player,
+      // over the head, to 180° in front — radius 3*TILE, duration 0.2s.
       for (const p of players) {
         if (now < p.swingUntil) {
-          const hb = swingHitbox(p);
-          ctx.fillStyle = "rgba(255,255,255,0.85)";
-          ctx.fillRect(hb.x, hb.y + hb.h / 2 - 3, hb.w, 6);
-          ctx.fillStyle = "rgba(226,232,240,0.5)";
-          ctx.fillRect(hb.x, hb.y, hb.w, hb.h);
+          const elapsed = SWING_DURATION - (p.swingUntil - now);
+          const progress = Math.max(0, Math.min(1, elapsed / SWING_DURATION));
+          const cx = p.x + p.w / 2;
+          const cy = p.y + p.h / 2;
+          // Base sweep (facing right): from angle π (behind, left) over top
+          // through 3π/2 to 2π (=0, front). Flip via scale for facing left.
+          const startA = Math.PI;
+          const endA = Math.PI + Math.PI * progress; // 0..1 of the half-circle
+          ctx.save();
+          ctx.translate(cx, cy);
+          if (p.facing === -1) ctx.scale(-1, 1);
+          // Trailing fan
+          ctx.fillStyle = "rgba(255,255,255,0.18)";
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.arc(0, 0, SWING_RADIUS, startA, endA, false);
+          ctx.closePath();
+          ctx.fill();
+          // Leading blade edge
+          ctx.strokeStyle = "rgba(255,255,255,0.95)";
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.arc(0, 0, SWING_RADIUS - 2, endA - 0.18, endA, false);
+          ctx.stroke();
+          // Blade tip highlight
+          const tipX = Math.cos(endA) * SWING_RADIUS;
+          const tipY = Math.sin(endA) * SWING_RADIUS;
+          ctx.fillStyle = "rgba(255,255,255,1)";
+          ctx.beginPath();
+          ctx.arc(tipX, tipY, 3, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
         }
       }
 
