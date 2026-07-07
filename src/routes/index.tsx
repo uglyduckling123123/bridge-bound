@@ -16,32 +16,44 @@ const PLACED_RED = 2;
 const PLACED_BLUE = 3;
 
 const BRIDGE_ROW = 10;
+// Bridge spans symmetrically: 13.5 is grid center, so START=1, END=26 (both 12.5 cols from center)
 const BRIDGE_START = 1;
 const BRIDGE_END = 26;
+const GRID_CENTER_COL = (BRIDGE_START + BRIDGE_END) / 2; // 13.5
 
 const GOAL_HEIGHT_TILES = 2;
+// Goals mirrored symmetrically across grid center
 const BLUE_GOAL = { col: BRIDGE_START, row: BRIDGE_ROW - GOAL_HEIGHT_TILES };
 const RED_GOAL = { col: BRIDGE_END, row: BRIDGE_ROW - GOAL_HEIGHT_TILES };
 
-const BLUE_SPAWN = { x: (BLUE_GOAL.col + 3) * TILE, y: (BRIDGE_ROW - 2) * TILE };
-const RED_SPAWN = { x: (RED_GOAL.col - 3) * TILE - 28, y: (BRIDGE_ROW - 2) * TILE };
+// Spawns: Blue at col 4, Red mirrored at col 26 (GRID_CENTER_COL - 4 + GRID_CENTER_COL = 23)
+const BLUE_SPAWN_COL = 4;
+const RED_SPAWN_COL = Math.round(2 * GRID_CENTER_COL - BLUE_SPAWN_COL); // 23
+const SPAWN_Y = (BRIDGE_ROW - 2) * TILE;
+const BLUE_SPAWN = { x: BLUE_SPAWN_COL * TILE, y: SPAWN_Y };
+const RED_SPAWN = { x: (RED_SPAWN_COL + 1) * TILE - 28, y: SPAWN_Y }; // +1 accounts for player width offset
 
 const MAX_BLOCKS = 32;
 const MAX_ARROWS = 6;
+const MAX_GAPPLE = 1;
 const WIN_SCORE = 5;
 const MAX_HP = 4;
 
 const SWING_DURATION = 200; // 0.2s visual arc
 const SWING_COOLDOWN = 380;
 const SWING_RADIUS = 3 * TILE; // 3-block radius arc
-const KNOCKBACK_VX = 10;
+const KNOCKBACK_VX = 12.5; // Buffed by 25% from 10 for punchier hits
 const KNOCKBACK_POP_VY = -7; // mandatory lift so victim doesn't stick on floor
 
 const GRAVITY = 0.5;
 const JUMP_HEIGHT_TILES = 1.8;
 // Kinematic jump velocity: v0 = sqrt(2 * g * h)  (h in pixels)
 const JUMP_V = Math.sqrt(2 * GRAVITY * (JUMP_HEIGHT_TILES * TILE));
-const MOVE_SPEED = 3.2;
+// Velocity-based movement: acceleration + terminal cap
+const MOVE_ACCEL = 0.4;
+const MOVE_TERMINAL = 4.5;
+const FRICTION = 0.85; // applied when no input
+const KNOCKBACK_OVERRIDE_FRAMES = 8; // knockback overrides input for this many frames
 
 const FALL_TERMINAL = 18;
 const FALL_TERMINAL_FLOATY = FALL_TERMINAL * 0.8; // 20% slower once past the peak
@@ -63,6 +75,7 @@ type Controls = {
   place: string;
   breakBlock: string;
   bow: string[];
+  gapple: string;
 };
 
 type Player = {
@@ -80,6 +93,9 @@ type Player = {
   blocksLeft: number;
   arrows: number;
   hp: number;
+  gappleCount: number;
+  gappleEatingUntil: number; // timestamp when eating animation ends
+  knockbackFrames: number; // remaining frames of knockback override
   swingUntil: number;
   swingReadyAt: number;
   spawn: { x: number; y: number };
@@ -129,6 +145,7 @@ function Index() {
   const [hpUi, setHpUi] = useState({ red: MAX_HP, blue: MAX_HP });
   const [blocksUi, setBlocksUi] = useState({ red: MAX_BLOCKS, blue: MAX_BLOCKS });
   const [arrowsUi, setArrowsUi] = useState({ red: MAX_ARROWS, blue: MAX_ARROWS });
+  const [gappleUi, setGappleUi] = useState({ red: MAX_GAPPLE, blue: MAX_GAPPLE });
   const [winner, setWinner] = useState<"Red" | "Blue" | null>(null);
   const [restartToken, setRestartToken] = useState(0);
 
@@ -137,6 +154,7 @@ function Index() {
     setHpUi({ red: MAX_HP, blue: MAX_HP });
     setBlocksUi({ red: MAX_BLOCKS, blue: MAX_BLOCKS });
     setArrowsUi({ red: MAX_ARROWS, blue: MAX_ARROWS });
+    setGappleUi({ red: MAX_GAPPLE, blue: MAX_GAPPLE });
     setWinner(null);
     setMode("menu");
     setRestartToken((n) => n + 1);
@@ -174,6 +192,7 @@ function Index() {
       id, x: spawn.x, y: spawn.y, vx: 0, vy: 0, w: 28, h: 40,
       color, name, facing, onGround: false,
       blocksLeft: MAX_BLOCKS, arrows: MAX_ARROWS, hp: MAX_HP,
+      gappleCount: MAX_GAPPLE, gappleEatingUntil: 0, knockbackFrames: 0,
       swingUntil: 0, swingReadyAt: 0, spawn, controls,
       aiming: false, aimStart: 0, aimAngleFixed: Math.PI / 4,
       placedTile: name === "Red" ? PLACED_RED : PLACED_BLUE,
@@ -182,11 +201,11 @@ function Index() {
     const players: Player[] = [
       makePlayer(0, "Red", "#ef4444", -1, RED_SPAWN, {
         left: "a", right: "d", jump: "w",
-        attack: [" "], place: "g", breakBlock: "h", bow: ["f"],
+        attack: [" "], place: "g", breakBlock: "h", bow: ["f"], gapple: "e",
       }),
       makePlayer(1, "Blue", "#3b82f6", 1, BLUE_SPAWN, {
         left: "arrowleft", right: "arrowright", jump: "arrowup",
-        attack: ["enter"], place: "k", breakBlock: "l", bow: ["i", "shift"],
+        attack: ["enter"], place: "k", breakBlock: "l", bow: ["i", "shift"], gapple: "o",
       }),
     ];
 
@@ -196,11 +215,14 @@ function Index() {
       setHpUi({ red: players[0].hp, blue: players[1].hp });
       setBlocksUi({ red: players[0].blocksLeft, blue: players[1].blocksLeft });
       setArrowsUi({ red: players[0].arrows, blue: players[1].arrows });
+      setGappleUi({ red: players[0].gappleCount, blue: players[1].gappleCount });
     };
 
     const respawnPlayer = (p: Player) => {
       p.x = p.spawn.x; p.y = p.spawn.y; p.vx = 0; p.vy = 0;
       p.hp = MAX_HP; p.blocksLeft = MAX_BLOCKS; p.arrows = MAX_ARROWS;
+      p.gappleCount = MAX_GAPPLE; p.gappleEatingUntil = 0;
+      p.knockbackFrames = 0;
       p.swingUntil = 0; p.aiming = false;
     };
 
@@ -246,6 +268,8 @@ function Index() {
       // Nudge off the ground so the collider doesn't immediately re-seat us.
       target.y -= 1;
       target.onGround = false;
+      // Knockback overrides input for KNOCKBACK_OVERRIDE_FRAMES frames
+      target.knockbackFrames = KNOCKBACK_OVERRIDE_FRAMES;
       target.hp -= 1;
       if (target.hp <= 0) respawnPlayer(target);
       syncUi();
@@ -501,6 +525,7 @@ function Index() {
       nextShotAt: 0,
       prevVy: 0,
       pillarJumpArmed: false,
+      jumpAttemptStart: 0, // timestamp for jump timeout tracking
       // Delayed perception exposed to executors:
       delayedRedX: 0,
       delayedRedY: 0,
@@ -541,8 +566,9 @@ function Index() {
       }
 
       // STATE D: RACING MODE
-      // Bot is closer to goal → sprint toward Red Goal
-      if (botDistToTarget < redDistToTarget) {
+      // Bot is at least 3 blocks closer to goal → sprint toward Red Goal
+      const RACE_THRESHOLD = TILE * 3;
+      if (botDistToTarget < redDistToTarget - RACE_THRESHOLD) {
         return BotState.RACE;
       }
 
@@ -557,13 +583,25 @@ function Index() {
     const moveTowards = (targetX: number) => {
       const me = players[1];
       const dx = targetX - (me.x + me.w / 2);
-      if (Math.abs(dx) < 4) { me.vx = 0; return; }
-      if (dx > 0) { me.vx = MOVE_SPEED; me.facing = 1; }
-      else { me.vx = -MOVE_SPEED; me.facing = -1; }
+      if (Math.abs(dx) < 4) {
+        me.vx *= FRICTION;
+        if (Math.abs(me.vx) < 0.1) me.vx = 0;
+        return;
+      }
+      // Velocity-based acceleration
+      if (dx > 0) {
+        me.vx += MOVE_ACCEL;
+        me.facing = 1;
+      } else {
+        me.vx -= MOVE_ACCEL;
+        me.facing = -1;
+      }
+      // Terminal cap
+      if (me.vx > MOVE_TERMINAL) me.vx = MOVE_TERMINAL;
+      if (me.vx < -MOVE_TERMINAL) me.vx = -MOVE_TERMINAL;
     };
 
-    // Clear obstacles ahead — bot is 2 blocks tall, so MUST clear both head and foot level
-    // to create a 2-block-high opening per spec
+    // Smart obstacle handling: jump over low walls, mine if blocked
     const clearForwardObstacles = (nowMs: number) => {
       const me = players[1];
       const dir = me.facing;
@@ -571,24 +609,68 @@ function Index() {
       const feetRow = Math.floor((me.y + me.h - 1) / TILE);
       const headRow = Math.floor(me.y / TILE);
       const aheadCol = cx + dir;
-      if (aheadCol < 0 || aheadCol >= COLS) return { cleared: false, bridged: false };
+      if (aheadCol < 0 || aheadCol >= COLS) return { cleared: false, bridged: false, jumping: false };
 
       const groundAhead = isSolid(aheadCol, feetRow + 1);
       const headBlocked = isSolid(aheadCol, headRow);
       const bodyBlocked = isSolid(aheadCol, feetRow);
 
-      // Sequential break: first head level, then foot level to clear 2-block-high passage
-      if ((headBlocked || bodyBlocked) && nowMs >= bot.nextActionAt) {
-        // Break head-level first if blocked
-        if (headBlocked) {
-          breakAt(me, aheadCol, headRow);
-          bot.nextActionAt = nowMs + 180;
-        } else if (bodyBlocked) {
-          // Then break foot/body level
-          breakAt(me, aheadCol, feetRow);
-          bot.nextActionAt = nowMs + 180;
+      // Check for wall that's jumpable (<= 2 blocks high with clear overhead)
+      if ((headBlocked || bodyBlocked) && me.onGround) {
+        // Scan above the wall to see if we can jump over
+        let wallHeight = 0;
+        let canJumpOver = true;
+        const maxJumpClear = 2; // can jump over 2-block-high walls
+
+        for (let h = 0; h < maxJumpClear + 1; h++) {
+          const checkRow = feetRow - h;
+          if (checkRow < 0) { canJumpOver = false; break; }
+          if (isSolid(aheadCol, checkRow)) {
+            wallHeight++;
+          } else {
+            // Found air, check if there's enough clearance above (2 blocks)
+            const clearanceRow1 = checkRow - 1;
+            const clearanceRow2 = checkRow - 2;
+            if (clearanceRow1 < 0 || clearanceRow2 < 0) {
+              canJumpOver = false;
+            } else if (isSolid(aheadCol, clearanceRow1) || isSolid(aheadCol, clearanceRow2)) {
+              canJumpOver = false; // ceiling blocks jump
+            }
+            break;
+          }
         }
-        return { cleared: true, bridged: false };
+
+        // If wall is <= 2 blocks high and clear overhead, try to jump
+        if (canJumpOver && wallHeight <= maxJumpClear && wallHeight > 0) {
+          // Check if we're stuck (1.5s timeout)
+          const stuckTooLong = nowMs >= bot.jumpAttemptStart + 1500;
+          if (!bot.jumpAttemptStart) bot.jumpAttemptStart = nowMs;
+
+          if (!stuckTooLong) {
+            // Execute forward jump
+            me.vy = -JUMP_V;
+            me.onGround = false;
+            // Maintain forward momentum
+            if (dir > 0) me.vx = Math.max(me.vx, MOVE_SPEED);
+            else me.vx = Math.min(me.vx, -MOVE_SPEED);
+            bot.jumpAttemptStart = 0; // reset on successful jump
+            return { cleared: false, bridged: false, jumping: true };
+          }
+          // Fall through to mining if stuck too long
+        }
+
+        // Sequential break: first head level, then foot level to clear 2-block-high passage
+        if (nowMs >= bot.nextActionAt) {
+          if (headBlocked) {
+            breakAt(me, aheadCol, headRow);
+            bot.nextActionAt = nowMs + 180;
+          } else if (bodyBlocked) {
+            breakAt(me, aheadCol, feetRow);
+            bot.nextActionAt = nowMs + 180;
+          }
+          bot.jumpAttemptStart = 0; // reset timeout tracking
+          return { cleared: true, bridged: false, jumping: false };
+        }
       }
 
       // Smart bridging: void ahead → briefly halt, place block, resume movement
@@ -596,10 +678,10 @@ function Index() {
         me.vx = 0;
         if (placeAt(me, aheadCol, feetRow + 1)) {
           bot.nextActionAt = nowMs + 180;
-          return { cleared: false, bridged: true };
+          return { cleared: false, bridged: true, jumping: false };
         }
       }
-      return { cleared: false, bridged: false };
+      return { cleared: false, bridged: false, jumping: false };
     };
 
     // STATE A executor — checked every frame for clutch saves
@@ -766,8 +848,23 @@ function Index() {
         // inputs — every held key is checked exactly once per frame.
         for (const p of players) {
           if (botMode && p.id === 1) continue;
+
+          // Gapple: freeze input during eating animation (0.3s)
+          const isEating = now < p.gappleEatingUntil;
+          if (isEating) continue;
+
+          // Gapple trigger: edge-triggered with instant consume (debouncer via flag)
+          if (justPressed.has(p.controls.gapple) && p.gappleCount > 0) {
+            p.gappleCount = 0; // instant debit to prevent duplicate triggers
+            p.hp = MAX_HP; // full heal
+            p.gappleEatingUntil = now + 300; // 0.3s freeze
+            syncUi();
+            continue; // skip all other input this frame
+          }
+
           // Jump: held-flag check, self-gated by onGround (no repeat mid-air).
-          if (keysPressed[p.controls.jump] && p.onGround) {
+          // Skip if knockback is overriding input
+          if (keysPressed[p.controls.jump] && p.onGround && p.knockbackFrames <= 0) {
             p.vy = -JUMP_V;
             p.onGround = false;
           }
@@ -797,14 +894,36 @@ function Index() {
         }
 
         for (const p of players) {
+          // Gapple freeze stops all movement updates
+          const isEating = now < p.gappleEatingUntil;
+          if (isEating) continue;
+
           if (botMode && p.id === 1) {
             updateBot(now);
           } else {
-            const left = keysPressed[p.controls.left];
-            const right = keysPressed[p.controls.right];
-            if (left && !right) { p.vx = -MOVE_SPEED; p.facing = -1; }
-            else if (right && !left) { p.vx = MOVE_SPEED; p.facing = 1; }
-            else { if (Math.abs(p.vx) > 0.4) p.vx *= 0.8; else p.vx = 0; }
+            // Decrement knockback frames
+            if (p.knockbackFrames > 0) p.knockbackFrames--;
+
+            // Velocity-based movement with acceleration + terminal cap
+            // Skip horizontal input while knockback override is active
+            if (p.knockbackFrames <= 0) {
+              const left = keysPressed[p.controls.left];
+              const right = keysPressed[p.controls.right];
+              if (left && !right) {
+                p.vx -= MOVE_ACCEL;
+                p.facing = -1;
+              } else if (right && !left) {
+                p.vx += MOVE_ACCEL;
+                p.facing = 1;
+              } else {
+                // Friction when no input
+                p.vx *= FRICTION;
+                if (Math.abs(p.vx) < 0.1) p.vx = 0;
+              }
+              // Terminal cap
+              if (p.vx > MOVE_TERMINAL) p.vx = MOVE_TERMINAL;
+              if (p.vx < -MOVE_TERMINAL) p.vx = -MOVE_TERMINAL;
+            }
           }
           p.vy += GRAVITY;
           // Floatier fall arc: once past the jump peak (vy > 0), cap the
@@ -1025,8 +1144,10 @@ function Index() {
           const hp = hpUi[team];
           const blocks = blocksUi[team];
           const ammo = arrowsUi[team];
+          const gapple = gappleUi[team];
           const label = team === "red" ? "Red" : (mode === "bot" ? "Blue (Bot)" : "Blue");
           const color = team === "red" ? "#ef4444" : "#3b82f6";
+          const gappleColor = gapple > 0 ? "#fbbf24" : "#6b7280";
           return (
             <div key={team} className="rounded border p-2" style={{ borderColor: `${color}55`, background: `${color}0d` }}>
               <div className="mb-1 flex items-center justify-between text-xs font-semibold" style={{ color }}>
@@ -1035,6 +1156,7 @@ function Index() {
                   <span>HP {hp}/{MAX_HP}</span>
                   <span>· Blocks {blocks}/{MAX_BLOCKS}</span>
                   <span className="flex items-center gap-1"><ArrowIcon />{ammo}/{MAX_ARROWS}</span>
+                  <span className="flex items-center gap-1" style={{ color: gappleColor }}><span className="text-lg">&#127822;</span>{gapple}/{MAX_GAPPLE}</span>
                 </span>
               </div>
               <div className="mb-1 h-2 w-full overflow-hidden rounded bg-slate-800">
@@ -1092,7 +1214,7 @@ function Index() {
       <div className="grid max-w-3xl grid-cols-1 gap-2 text-xs text-slate-300 md:grid-cols-2">
         <div className="rounded border border-red-500/30 bg-red-500/5 p-3">
           <div className="mb-1 font-semibold text-red-400">Red — WASD + Mouse</div>
-          Move: A / D · Jump: W · Sword: Space · Bow (hold): F · Left-click: Place · Right-click: Break (5-tile range)
+          Move: A / D · Jump: W · Sword: Space · Bow (hold): F · Gapple (heal): E · Left-click: Place · Right-click: Break (5-tile range)
         </div>
         <div className="rounded border border-blue-500/30 bg-blue-500/5 p-3">
           <div className="mb-1 font-semibold text-blue-400">
@@ -1100,7 +1222,7 @@ function Index() {
           </div>
           {mode === "bot"
             ? "Controlled by AI. Choose 1v1 in the menu to play as Blue."
-            : "Move: ← → · Jump: ↑ · Sword: Enter · Bow (hold): I or RShift · Place: K · Break: L"}
+            : "Move: ← → · Jump: ↑ · Sword: Enter · Bow (hold): I or RShift · Gapple: O · Place: K · Break: L"}
         </div>
       </div>
     </div>
