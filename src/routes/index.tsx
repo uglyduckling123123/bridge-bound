@@ -534,18 +534,56 @@ function Index() {
       const now = performance.now();
 
       if (!gameOver) {
+        // -------- Frame-loop input: evaluate direct flags FIRST --------
+        // Doing this at the top of the tick guarantees no dropped or delayed
+        // inputs — every held key is checked exactly once per frame.
+        for (const p of players) {
+          if (botMode && p.id === 1) continue;
+          // Jump: held-flag check, self-gated by onGround (no repeat mid-air).
+          if (keysPressed[p.controls.jump] && p.onGround) {
+            p.vy = -JUMP_V;
+            p.onGround = false;
+          }
+          // Edge-triggered actions from justPressed.
+          for (const ak of p.controls.attack) {
+            if (justPressed.has(ak)) { attack(p); break; }
+          }
+          if (p.id === 1) {
+            if (justPressed.has(p.controls.place)) placeFront(p);
+            if (justPressed.has(p.controls.breakBlock)) breakFront(p);
+          }
+          for (const bk of p.controls.bow) {
+            if (justPressed.has(bk) && !p.aiming && p.arrows > 0) {
+              p.aiming = true; p.aimStart = now;
+              break;
+            }
+          }
+          // Bow release: fire when no bow key is still held.
+          if (p.aiming) {
+            const stillHeld = p.controls.bow.some((bk) => keysPressed[bk]);
+            const released = p.controls.bow.some((bk) => justReleased.has(bk));
+            if (released && !stillHeld) {
+              fireArrow(p, aimAngle(p, now));
+              p.aiming = false;
+            }
+          }
+        }
+
         for (const p of players) {
           if (botMode && p.id === 1) {
             updateBot(now);
           } else {
-            const left = keys.has(p.controls.left);
-            const right = keys.has(p.controls.right);
+            const left = keysPressed[p.controls.left];
+            const right = keysPressed[p.controls.right];
             if (left && !right) { p.vx = -MOVE_SPEED; p.facing = -1; }
             else if (right && !left) { p.vx = MOVE_SPEED; p.facing = 1; }
             else { if (Math.abs(p.vx) > 0.4) p.vx *= 0.8; else p.vx = 0; }
           }
           p.vy += GRAVITY;
-          if (p.vy > 18) p.vy = 18;
+          // Floatier fall arc: once past the jump peak (vy > 0), cap the
+          // terminal fall speed 20% lower for a distinct, softer descent.
+          const cap = p.vy > 0 ? FALL_TERMINAL_FLOATY : FALL_TERMINAL;
+          if (p.vy > cap) p.vy = cap;
 
           moveAxis(p, p.vx, 0);
           moveAxis(p, 0, p.vy);
