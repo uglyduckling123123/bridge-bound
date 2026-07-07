@@ -485,13 +485,13 @@ function Index() {
       return { delayedRedX: chosen.redX, delayedRedY: chosen.redY, delayedGrid: chosen.grid };
     };
 
+    // State machine per spec: A=VOID_RECOVERY, B=PILLAR, C=INTERCEPT, D=RACE, E=COMBAT
     enum BotState {
-      RACE = "RACE",
-      INTERCEPT = "INTERCEPT",
-      DEFENSE = "DEFENSE",
-      SABOTAGE = "SABOTAGE",
-      PILLAR = "PILLAR",
       VOID_RECOVERY = "VOID_RECOVERY",
+      PILLAR = "PILLAR",
+      INTERCEPT = "INTERCEPT",
+      RACE = "RACE",
+      COMBAT = "COMBAT",
     }
 
     const bot = {
@@ -513,75 +513,44 @@ function Index() {
     const RED_GOAL_X = RED_GOAL.col * TILE;
     const BLUE_GOAL_X = BLUE_GOAL.col * TILE;
 
-    const isBotSolid = (g: number[][], col: number, row: number) => {
-      if (row < 0 || row >= ROWS || col < 0 || col >= COLS) return false;
-      const t = g[row][col];
-      return t === BLOCK || t === PLACED_RED || t === PLACED_BLUE;
-    };
-    const isEnemyBlock = (t: number) => t === PLACED_RED;
+    // Helper: check if a tile is a placed block (used for block recovery on break)
     const isPlacedTile = (t: number) => t === PLACED_RED || t === PLACED_BLUE;
 
-    const pathBlockedByEnemy = (fromX: number, toX: number, y: number, g: number[][]) => {
-      const r = Math.floor((y + players[1].h / 2) / TILE);
-      const c1 = Math.floor(Math.min(fromX, toX) / TILE);
-      const c2 = Math.floor(Math.max(fromX, toX) / TILE);
-      for (let c = c1; c <= c2; c++) {
-        if (isEnemyBlock(g[r]?.[c] ?? AIR)) return true;
-      }
-      return false;
-    };
-
-    const redSupportedByPlacedOverVoid = (rx: number, ry: number, g: number[][]) => {
-      const col = Math.floor((rx + players[0].w / 2) / TILE);
-      const feetRow = Math.floor((ry + players[0].h) / TILE);
-      const under = g[feetRow]?.[col] ?? AIR;
-      if (!isPlacedTile(under)) return false;
-      // Is there void beneath the placed block(s)? Scan a few rows down.
-      for (let r = feetRow + 1; r < ROWS; r++) {
-        if (g[r][col] === BLOCK) return false; // real bridge under → not floating
-        if (g[r][col] === AIR) return true;
-      }
-      return true;
-    };
-
+    // State evaluation (called every 0.5s) — returns state based on spec priority B→C→D→E
+    // STATE A (VOID_RECOVERY) is evaluated every frame BEFORE this is called
     const evaluateState = (nowMs: number): BotState => {
       const me = players[1];
       const { delayedRedX, delayedRedY, delayedGrid } = bot;
 
-      // STATE A is evaluated every frame separately — skipped here.
-
-      // STATE B: pillaring / elevation matching
-      const heightDiff = me.y - delayedRedY; // positive means red is higher
-      const horizProxToRed = Math.abs(delayedRedX - me.x);
-      if (heightDiff > TILE * 1.2 && horizProxToRed < TILE * 3) {
-        return BotState.PILLAR;
-      }
-
+      // Metrics per spec
       const botDistToTarget = Math.abs(me.x - RED_GOAL_X);
       const redDistToTarget = Math.abs(delayedRedX - BLUE_GOAL_X);
 
-      // STATE C: defense — red is closer to scoring than we are to ours
-      if (redDistToTarget < botDistToTarget - 8) {
-        return BotState.DEFENSE;
+      // STATE B: VERTICAL PILLARING / ELEVATION MATCHING
+      // Red is significantly higher and within short horizontal range
+      const heightDiff = me.y - delayedRedY; // positive = red is higher (y grows downward)
+      const horizProxToRed = Math.abs(delayedRedX - me.x);
+      if (heightDiff > TILE * 1.5 && horizProxToRed < TILE * 3) {
+        return BotState.PILLAR;
       }
 
-      // STATE D: path sabotage
-      const redAtBridgeLevel = Math.abs(delayedRedY - (BRIDGE_ROW - 2) * TILE) < TILE * 1.5;
-      if (redAtBridgeLevel && redSupportedByPlacedOverVoid(delayedRedX, delayedRedY, delayedGrid)) {
-        return BotState.SABOTAGE;
+      // STATE C: INTERCEPT & ENGAGE MODE
+      // Opponent is closer to scoring than bot → charge toward delayedRedX
+      if (redDistToTarget < botDistToTarget - TILE * 0.5) {
+        return BotState.INTERCEPT;
       }
 
-      // STATE E: racing — we're closer and path is clear of enemy blocks
-      if (
-        botDistToTarget < redDistToTarget &&
-        !pathBlockedByEnemy(me.x, RED_GOAL_X, me.y, delayedGrid)
-      ) {
+      // STATE D: RACING MODE
+      // Bot is closer to goal → sprint toward Red Goal
+      if (botDistToTarget < redDistToTarget) {
         return BotState.RACE;
       }
 
-      // STATE F: fallback intercept & combat
-      return BotState.INTERCEPT;
+      // STATE E: COMBAT MODE (default fallback)
+      // Handle ranged/melee combat, obstacle clearing
+      return BotState.COMBAT;
       void nowMs;
+      void delayedGrid;
     };
 
     // ---- executors: run every frame for fluid movement ----
@@ -593,11 +562,8 @@ function Index() {
       else { me.vx = -MOVE_SPEED; me.facing = -1; }
     };
 
-    const jumpIfGrounded = () => {
-      const me = players[1];
-      if (me.onGround) { me.vy = -JUMP_V; me.onGround = false; }
-    };
-
+    // Clear obstacles ahead — bot is 2 blocks tall, so MUST clear both head and foot level
+    // to create a 2-block-high opening per spec
     const clearForwardObstacles = (nowMs: number) => {
       const me = players[1];
       const dir = me.facing;
@@ -605,25 +571,35 @@ function Index() {
       const feetRow = Math.floor((me.y + me.h - 1) / TILE);
       const headRow = Math.floor(me.y / TILE);
       const aheadCol = cx + dir;
-      if (aheadCol < 0 || aheadCol >= COLS) return;
+      if (aheadCol < 0 || aheadCol >= COLS) return { cleared: false, bridged: false };
+
       const groundAhead = isSolid(aheadCol, feetRow + 1);
       const headBlocked = isSolid(aheadCol, headRow);
       const bodyBlocked = isSolid(aheadCol, feetRow);
 
+      // Sequential break: first head level, then foot level to clear 2-block-high passage
       if ((headBlocked || bodyBlocked) && nowMs >= bot.nextActionAt) {
-        const oldFacing = me.facing;
-        me.facing = dir as 1 | -1;
-        breakFront(me);
-        me.facing = oldFacing;
-        bot.nextActionAt = nowMs + 220;
-        return;
+        // Break head-level first if blocked
+        if (headBlocked) {
+          breakAt(me, aheadCol, headRow);
+          bot.nextActionAt = nowMs + 180;
+        } else if (bodyBlocked) {
+          // Then break foot/body level
+          breakAt(me, aheadCol, feetRow);
+          bot.nextActionAt = nowMs + 180;
+        }
+        return { cleared: true, bridged: false };
       }
-      // Smart bridging: void ahead → briefly halt and place under the gap
+
+      // Smart bridging: void ahead → briefly halt, place block, resume movement
       if (!groundAhead && me.onGround && me.blocksLeft > 0 && nowMs >= bot.nextActionAt) {
         me.vx = 0;
-        placeAt(me, aheadCol, feetRow + 1);
-        bot.nextActionAt = nowMs + 180;
+        if (placeAt(me, aheadCol, feetRow + 1)) {
+          bot.nextActionAt = nowMs + 180;
+          return { cleared: false, bridged: true };
+        }
       }
+      return { cleared: false, bridged: false };
     };
 
     // STATE A executor — checked every frame for clutch saves
@@ -656,88 +632,87 @@ function Index() {
       return true;
     };
 
+    // STATE B executor: Pillar upward to match opponent's height
     const executePillar = (nowMs: number) => {
       const me = players[1];
-      moveTowards(me.x + me.w / 2); // stay in place horizontally
+      // Stay roughly in place horizontally
       me.vx = 0;
+
+      // If grounded, trigger jump
       if (me.onGround) {
-        jumpIfGrounded();
+        me.vy = -JUMP_V;
+        me.onGround = false;
         bot.pillarJumpArmed = true;
       }
-      // Detect the peak: vy transitions from negative toward >= 0.
+
+      // At the exact peak of jump (vy transitions from negative toward >= 0),
+      // place block directly beneath feet to build tower
       const atPeak = bot.pillarJumpArmed && bot.prevVy < 0 && me.vy >= -0.2;
       if (atPeak && me.blocksLeft > 0 && nowMs >= bot.nextActionAt) {
         const col = Math.floor((me.x + me.w / 2) / TILE);
-        const row = Math.floor((me.y + me.h) / TILE) + 1;
-        if (placeAt(me, col, row)) bot.nextActionAt = nowMs + 200;
+        // Place block at row below feet (we're in the air, so this is where we jumped from)
+        const row = Math.floor((me.y + me.h) / TILE);
+        if (placeAt(me, col, row)) {
+          bot.nextActionAt = nowMs + 200;
+        }
         bot.pillarJumpArmed = false;
       }
     };
 
-    const executeDefense = (nowMs: number) => {
-      const me = players[1];
-      moveTowards(BLUE_GOAL_X);
-      clearForwardObstacles(nowMs);
-      // Blockade: if we're ahead of red (between red and blue goal), wall up.
-      const meAhead = Math.abs(me.x - BLUE_GOAL_X) < Math.abs(bot.delayedRedX - BLUE_GOAL_X) - TILE;
-      if (meAhead && me.onGround && me.blocksLeft >= 2 && nowMs >= bot.nextActionAt) {
-        // Face the incoming red
-        me.facing = bot.delayedRedX > me.x ? 1 : -1;
-        const cx = Math.floor((me.x + me.w / 2) / TILE);
-        const feetRow = Math.floor((me.y + me.h - 1) / TILE);
-        const col = cx + me.facing;
-        const okLow = placeAt(me, col, feetRow);
-        const okHigh = placeAt(me, col, feetRow - 1);
-        if (okLow || okHigh) bot.nextActionAt = nowMs + 260;
-        // Then smoothly hop over our own wall
-        jumpIfGrounded();
-      }
-    };
-
-    const executeSabotage = (nowMs: number) => {
-      const me = players[1];
-      // Move under the block supporting the delayed red position.
-      const targetCol = Math.floor((bot.delayedRedX + players[0].w / 2) / TILE);
-      const targetX = targetCol * TILE + TILE / 2;
-      moveTowards(targetX);
-      clearForwardObstacles(nowMs);
-      // Break the specific block directly beneath the delayed opponent.
-      const feetRow = Math.floor((bot.delayedRedY + players[0].h) / TILE);
-      if (nowMs >= bot.nextActionAt && isPlacedTile(grid[feetRow]?.[targetCol] ?? AIR)) {
-        breakAt(me, targetCol, feetRow);
-        bot.nextActionAt = nowMs + 180;
-      }
-    };
-
-    const executeRace = (nowMs: number) => {
-      moveTowards(RED_GOAL_X);
-      clearForwardObstacles(nowMs);
-    };
-
+    // STATE C executor: Intercept — charge toward delayedRedX for close-quarters combat
     const executeIntercept = (nowMs: number) => {
       const me = players[1];
       const foe = players[0];
+
+      // Face and move toward delayed opponent position
       const horizDelayed = bot.delayedRedX - me.x;
       me.facing = horizDelayed >= 0 ? 1 : -1;
+      moveTowards(bot.delayedRedX);
+      clearForwardObstacles(nowMs);
 
-      // Melee (uses live foe for real hit resolution; facing was set from delayed x)
+      // Melee attack (use live foe position for actual hit detection)
       const meleeDist = TILE * 1.2;
       if (Math.abs(foe.x - me.x) < meleeDist && Math.abs(foe.y - me.y) < TILE * 1.4) {
         attack(me);
       }
+    };
 
-      // Ranged
+    // STATE D executor: Racing — sprint toward Red Goal, clear obstacles, bridge gaps
+    const executeRace = (nowMs: number) => {
+      const me = players[1];
+
+      // Face toward Red Goal
+      me.facing = me.x < RED_GOAL_X ? 1 : -1;
+      moveTowards(RED_GOAL_X);
+      clearForwardObstacles(nowMs);
+    };
+
+    // STATE E executor: Combat — ranged/melee attacks while maintaining forward movement
+    const executeCombat = (nowMs: number) => {
+      const me = players[1];
+      const foe = players[0];
+      const horizDelayed = bot.delayedRedX - me.x;
+
+      // Face opponent
+      me.facing = horizDelayed >= 0 ? 1 : -1;
+
+      // Ranged: if long-range, Y-aligned, have arrows → fire with upward compensation
       const yAligned = Math.abs(bot.delayedRedY - me.y) < TILE * 1.5;
       const longRange = Math.abs(horizDelayed) > TILE * 4;
       if (yAligned && longRange && me.arrows > 0 && nowMs >= bot.nextShotAt) {
-        // Upward angle compensation for gravity drop.
         const dist = Math.abs(horizDelayed);
         const comp = Math.min(0.5, 0.05 + dist / (TILE * 40));
         fireArrow(me, comp);
         bot.nextShotAt = nowMs + 850;
       }
 
-      // Approach target while clearing obstacles.
+      // Melee: if close range, continuously attack
+      const meleeDist = TILE * 1.2;
+      if (Math.abs(foe.x - me.x) < meleeDist && Math.abs(foe.y - me.y) < TILE * 1.4) {
+        attack(me);
+      }
+
+      // Clear obstacles while maintaining forward momentum
       moveTowards(bot.delayedRedX);
       clearForwardObstacles(nowMs);
     };
@@ -745,33 +720,33 @@ function Index() {
     const updateBot = (nowMs: number) => {
       const me = players[1];
 
-      // Refresh delayed perception once per tick.
+      // Refresh delayed perception once per tick
       const { delayedRedX, delayedRedY, delayedGrid } = getDelayedPerception(Date.now());
       bot.delayedRedX = delayedRedX;
       bot.delayedRedY = delayedRedY;
       bot.delayedGrid = delayedGrid;
 
-      // STATE A always evaluated first, every frame — clutch save bypass.
+      // STATE A: VOID RECOVERY — evaluated every frame (bypasses 0.5s timer for safety)
+      // Per spec: If bot is below bridge level and falling, instantly place block beneath feet
       if (tryVoidRecovery(nowMs)) {
         bot.currentState = BotState.VOID_RECOVERY;
         bot.prevVy = me.vy;
         return;
       }
 
-      // Evaluate remaining states on a 0.5s cadence to avoid jitter.
+      // Evaluate remaining states on a 0.5s cadence to avoid jitter
       if (nowMs >= bot.nextEvalAt) {
         bot.currentState = evaluateState(nowMs);
         bot.nextEvalAt = nowMs + EVAL_INTERVAL;
       }
 
-      // Execute the chosen state every frame for fluid behavior.
+      // Execute the chosen state every frame for fluid, responsive behavior
       switch (bot.currentState) {
-        case BotState.PILLAR:    executePillar(nowMs); break;
-        case BotState.DEFENSE:   executeDefense(nowMs); break;
-        case BotState.SABOTAGE:  executeSabotage(nowMs); break;
-        case BotState.RACE:      executeRace(nowMs); break;
-        case BotState.INTERCEPT:
-        default:                 executeIntercept(nowMs); break;
+        case BotState.PILLAR:    executePillar(nowMs); break;    // STATE B
+        case BotState.INTERCEPT: executeIntercept(nowMs); break; // STATE C
+        case BotState.RACE:      executeRace(nowMs); break;      // STATE D
+        case BotState.COMBAT:
+        default:                 executeCombat(nowMs); break;    // STATE E
       }
 
       bot.prevVy = me.vy;
