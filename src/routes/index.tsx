@@ -31,15 +31,20 @@ const MAX_ARROWS = 6;
 const WIN_SCORE = 5;
 const MAX_HP = 4;
 
-const SWING_DURATION = 180;
+const SWING_DURATION = 200; // 0.2s visual arc
 const SWING_COOLDOWN = 380;
-const SWING_REACH = 44;
+const SWING_RADIUS = 3 * TILE; // 3-block radius arc
 const KNOCKBACK_VX = 10;
-const KNOCKBACK_VY = -6;
+const KNOCKBACK_POP_VY = -7; // mandatory lift so victim doesn't stick on floor
 
 const GRAVITY = 0.5;
-const JUMP_V = 6.2;
+const JUMP_HEIGHT_TILES = 1.8;
+// Kinematic jump velocity: v0 = sqrt(2 * g * h)  (h in pixels)
+const JUMP_V = Math.sqrt(2 * GRAVITY * (JUMP_HEIGHT_TILES * TILE));
 const MOVE_SPEED = 3.2;
+
+const FALL_TERMINAL = 18;
+const FALL_TERMINAL_FLOATY = FALL_TERMINAL * 0.8; // 20% slower once past the peak
 
 const AIM_PERIOD_MS = 2000;
 const ARROW_SPEED = 11;
@@ -228,9 +233,19 @@ function Index() {
       }
     };
 
-    const damage = (target: Player, dir: 1 | -1) => {
-      target.vx = KNOCKBACK_VX * dir;
-      target.vy = KNOCKBACK_VY;
+    // Vector knockback with mandatory vertical "pop" so the victim launches
+    // in a clean backward arc without sticking on floor tiles.
+    const damageVector = (target: Player, dirX: number, dirY: number) => {
+      // Normalize the horizontal component; force a lift regardless of dirY.
+      const mag = Math.hypot(dirX, dirY) || 1;
+      const nx = dirX / mag;
+      target.vx = KNOCKBACK_VX * (nx === 0 ? (Math.random() < 0.5 ? -1 : 1) : Math.sign(nx));
+      // Blend a bit of the incoming vertical direction with the mandatory pop.
+      const ny = dirY / mag;
+      target.vy = KNOCKBACK_POP_VY + Math.min(0, ny * 2);
+      // Nudge off the ground so the collider doesn't immediately re-seat us.
+      target.y -= 1;
+      target.onGround = false;
       target.hp -= 1;
       if (target.hp <= 0) respawnPlayer(target);
       syncUi();
@@ -263,10 +278,12 @@ function Index() {
       return true;
     };
 
+    // Every tile — including the initial bridge — is stored in the unified
+    // grid and can be removed by index assignment (splice-equivalent for a 2D array).
     const breakAt = (p: Player, col: number, row: number) => {
       if (col < 0 || col >= COLS || row < 0 || row >= ROWS) return false;
       const t = grid[row][col];
-      if (t !== PLACED_RED && t !== PLACED_BLUE) return false;
+      if (t === AIR) return false;
       grid[row][col] = AIR;
       if (t === p.placedTile) p.blocksLeft = Math.min(MAX_BLOCKS, p.blocksLeft + 1);
       syncUi();
@@ -274,7 +291,6 @@ function Index() {
     };
 
     const placeFront = (p: Player) => {
-      // try 1 tile ahead, else 2
       const f1 = frontTile(p, 1);
       if (placeAt(p, f1.col, f1.row)) return;
       const f2 = frontTile(p, 2);
@@ -288,21 +304,25 @@ function Index() {
       breakAt(p, f2.col, f2.row);
     };
 
-    const swingHitbox = (p: Player) => {
-      const x = p.facing === 1 ? p.x + p.w : p.x - SWING_REACH;
-      return { x, y: p.y + 4, w: SWING_REACH, h: p.h - 8 };
-    };
-
+    // Instant, vector-based hit detection — runs the frame the key is pressed.
+    // The visual arc (drawn separately) takes 0.2s but mechanics resolve NOW.
     const attack = (p: Player) => {
       const now = performance.now();
       if (now < p.swingReadyAt) return;
       p.swingUntil = now + SWING_DURATION;
       p.swingReadyAt = now + SWING_COOLDOWN;
-      const hb = swingHitbox(p);
+      const acx = p.x + p.w / 2;
+      const acy = p.y + p.h / 2;
       for (const other of players) {
         if (other.id === p.id) continue;
-        if (rectsOverlap(hb.x, hb.y, hb.w, hb.h, other.x, other.y, other.w, other.h)) {
-          damage(other, p.facing);
+        const ocx = other.x + other.w / 2;
+        const ocy = other.y + other.h / 2;
+        const dx = ocx - acx;
+        const dy = ocy - acy;
+        // 3-block radius arc — semicircle sweeps behind → over head → in front,
+        // which in practice covers the full circle around the attacker.
+        if (dx * dx + dy * dy <= SWING_RADIUS * SWING_RADIUS) {
+          damageVector(other, dx, dy);
         }
       }
     };
@@ -355,48 +375,36 @@ function Index() {
     canvas.addEventListener("mousedown", onMouseDown);
     canvas.addEventListener("contextmenu", onCtx);
 
-    // ---------- Keyboard ----------
-    const keys = new Set<string>();
+    // ---------- Keyboard: zero-latency direct boolean flags ----------
+    // `keysPressed` is the authoritative held-key dictionary.
+    // `justPressed` is populated on the leading edge of a keydown and drained
+    // by the frame loop, so edge-triggered actions (attack, place, break, bow
+    // start) can never be dropped or duplicated by async event scheduling.
+    const keysPressed: Record<string, boolean> = {};
+    const justPressed = new Set<string>();
+    const justReleased = new Set<string>();
+
     const onDown = (e: KeyboardEvent) => {
-      if (gameOver) return;
       const k = e.key.toLowerCase();
       if (k.startsWith("arrow") || k === " ") e.preventDefault();
-      const wasDown = keys.has(k);
-      keys.add(k);
-      if (wasDown) return;
-
-      const now = performance.now();
-      for (const p of players) {
-        if (botMode && p.id === 1) continue; // bot controls blue
-        if (k === p.controls.jump && p.onGround) { p.vy = -JUMP_V; p.onGround = false; }
-        if (p.controls.attack.includes(k)) attack(p);
-        // Red uses mouse for placing/breaking; keep keys only for Blue in 1v1
-        if (p.id === 1) {
-          if (k === p.controls.place) placeFront(p);
-          if (k === p.controls.breakBlock) breakFront(p);
-        }
-        if (p.controls.bow.includes(k) && !p.aiming && p.arrows > 0) {
-          p.aiming = true; p.aimStart = now;
-        }
-      }
+      if (gameOver) return;
+      if (!keysPressed[k]) justPressed.add(k);
+      keysPressed[k] = true;
     };
     const onUp = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase();
-      keys.delete(k);
-      const now = performance.now();
-      for (const p of players) {
-        if (botMode && p.id === 1) continue;
-        if (p.controls.bow.includes(k) && p.aiming) {
-          const stillHeld = p.controls.bow.some((bk) => keys.has(bk));
-          if (!stillHeld) {
-            fireArrow(p, aimAngle(p, now));
-            p.aiming = false;
-          }
-        }
-      }
+      if (keysPressed[k]) justReleased.add(k);
+      keysPressed[k] = false;
     };
     window.addEventListener("keydown", onDown);
     window.addEventListener("keyup", onUp);
+
+    // Alias `keys` for existing helpers (mouse indicator, bot hold checks).
+    const keys = {
+      has: (k: string) => !!keysPressed[k],
+    };
+    void keys;
+
 
     const moveAxis = (p: Player, dx: number, dy: number) => {
       p.x += dx;
@@ -526,18 +534,56 @@ function Index() {
       const now = performance.now();
 
       if (!gameOver) {
+        // -------- Frame-loop input: evaluate direct flags FIRST --------
+        // Doing this at the top of the tick guarantees no dropped or delayed
+        // inputs — every held key is checked exactly once per frame.
+        for (const p of players) {
+          if (botMode && p.id === 1) continue;
+          // Jump: held-flag check, self-gated by onGround (no repeat mid-air).
+          if (keysPressed[p.controls.jump] && p.onGround) {
+            p.vy = -JUMP_V;
+            p.onGround = false;
+          }
+          // Edge-triggered actions from justPressed.
+          for (const ak of p.controls.attack) {
+            if (justPressed.has(ak)) { attack(p); break; }
+          }
+          if (p.id === 1) {
+            if (justPressed.has(p.controls.place)) placeFront(p);
+            if (justPressed.has(p.controls.breakBlock)) breakFront(p);
+          }
+          for (const bk of p.controls.bow) {
+            if (justPressed.has(bk) && !p.aiming && p.arrows > 0) {
+              p.aiming = true; p.aimStart = now;
+              break;
+            }
+          }
+          // Bow release: fire when no bow key is still held.
+          if (p.aiming) {
+            const stillHeld = p.controls.bow.some((bk) => keysPressed[bk]);
+            const released = p.controls.bow.some((bk) => justReleased.has(bk));
+            if (released && !stillHeld) {
+              fireArrow(p, aimAngle(p, now));
+              p.aiming = false;
+            }
+          }
+        }
+
         for (const p of players) {
           if (botMode && p.id === 1) {
             updateBot(now);
           } else {
-            const left = keys.has(p.controls.left);
-            const right = keys.has(p.controls.right);
+            const left = keysPressed[p.controls.left];
+            const right = keysPressed[p.controls.right];
             if (left && !right) { p.vx = -MOVE_SPEED; p.facing = -1; }
             else if (right && !left) { p.vx = MOVE_SPEED; p.facing = 1; }
             else { if (Math.abs(p.vx) > 0.4) p.vx *= 0.8; else p.vx = 0; }
           }
           p.vy += GRAVITY;
-          if (p.vy > 18) p.vy = 18;
+          // Floatier fall arc: once past the jump peak (vy > 0), cap the
+          // terminal fall speed 20% lower for a distinct, softer descent.
+          const cap = p.vy > 0 ? FALL_TERMINAL_FLOATY : FALL_TERMINAL;
+          if (p.vy > cap) p.vy = cap;
 
           moveAxis(p, p.vx, 0);
           moveAxis(p, 0, p.vy);
@@ -556,7 +602,7 @@ function Index() {
           for (const p of players) {
             if (p.id === a.owner) continue;
             if (a.x >= p.x && a.x <= p.x + p.w && a.y >= p.y && a.y <= p.y + p.h) {
-              damage(p, a.vx >= 0 ? 1 : -1);
+              damageVector(p, a.vx, a.vy);
               a.alive = false;
               break;
             }
@@ -566,6 +612,10 @@ function Index() {
 
         tryScore();
       }
+
+      // Drain per-frame edge sets after all input-consumers have run.
+      justPressed.clear();
+      justReleased.clear();
 
       // ---------- Draw ----------
       const grad = ctx.createLinearGradient(0, 0, 0, H);
@@ -634,13 +684,42 @@ function Index() {
         }
       }
 
+      // Sword swing visual arc: sweeps from 180° behind the player,
+      // over the head, to 180° in front — radius 3*TILE, duration 0.2s.
       for (const p of players) {
         if (now < p.swingUntil) {
-          const hb = swingHitbox(p);
-          ctx.fillStyle = "rgba(255,255,255,0.85)";
-          ctx.fillRect(hb.x, hb.y + hb.h / 2 - 3, hb.w, 6);
-          ctx.fillStyle = "rgba(226,232,240,0.5)";
-          ctx.fillRect(hb.x, hb.y, hb.w, hb.h);
+          const elapsed = SWING_DURATION - (p.swingUntil - now);
+          const progress = Math.max(0, Math.min(1, elapsed / SWING_DURATION));
+          const cx = p.x + p.w / 2;
+          const cy = p.y + p.h / 2;
+          // Base sweep (facing right): from angle π (behind, left) over top
+          // through 3π/2 to 2π (=0, front). Flip via scale for facing left.
+          const startA = Math.PI;
+          const endA = Math.PI + Math.PI * progress; // 0..1 of the half-circle
+          ctx.save();
+          ctx.translate(cx, cy);
+          if (p.facing === -1) ctx.scale(-1, 1);
+          // Trailing fan
+          ctx.fillStyle = "rgba(255,255,255,0.18)";
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.arc(0, 0, SWING_RADIUS, startA, endA, false);
+          ctx.closePath();
+          ctx.fill();
+          // Leading blade edge
+          ctx.strokeStyle = "rgba(255,255,255,0.95)";
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.arc(0, 0, SWING_RADIUS - 2, endA - 0.18, endA, false);
+          ctx.stroke();
+          // Blade tip highlight
+          const tipX = Math.cos(endA) * SWING_RADIUS;
+          const tipY = Math.sin(endA) * SWING_RADIUS;
+          ctx.fillStyle = "rgba(255,255,255,1)";
+          ctx.beginPath();
+          ctx.arc(tipX, tipY, 3, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
         }
       }
 
