@@ -613,6 +613,10 @@ function Index() {
         tryScore();
       }
 
+      // Drain per-frame edge sets after all input-consumers have run.
+      justPressed.clear();
+      justReleased.clear();
+
       // ---------- Draw ----------
       const grad = ctx.createLinearGradient(0, 0, 0, H);
       grad.addColorStop(0, "#0f172a"); grad.addColorStop(1, "#1e293b");
