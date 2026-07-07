@@ -783,6 +783,9 @@ function Index() {
       const now = performance.now();
 
       if (!gameOver) {
+        // Perception buffer: snapshot BEFORE any per-frame simulation so the
+        // bot's delayed lookup always sees a stable, past-tense world state.
+        if (botMode) pushHistory(Date.now());
         // -------- Frame-loop input: evaluate direct flags FIRST --------
         // Doing this at the top of the tick guarantees no dropped or delayed
         // inputs — every held key is checked exactly once per frame.
