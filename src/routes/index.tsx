@@ -233,9 +233,19 @@ function Index() {
       }
     };
 
-    const damage = (target: Player, dir: 1 | -1) => {
-      target.vx = KNOCKBACK_VX * dir;
-      target.vy = KNOCKBACK_VY;
+    // Vector knockback with mandatory vertical "pop" so the victim launches
+    // in a clean backward arc without sticking on floor tiles.
+    const damageVector = (target: Player, dirX: number, dirY: number) => {
+      // Normalize the horizontal component; force a lift regardless of dirY.
+      const mag = Math.hypot(dirX, dirY) || 1;
+      const nx = dirX / mag;
+      target.vx = KNOCKBACK_VX * (nx === 0 ? (Math.random() < 0.5 ? -1 : 1) : Math.sign(nx));
+      // Blend a bit of the incoming vertical direction with the mandatory pop.
+      const ny = dirY / mag;
+      target.vy = KNOCKBACK_POP_VY + Math.min(0, ny * 2);
+      // Nudge off the ground so the collider doesn't immediately re-seat us.
+      target.y -= 1;
+      target.onGround = false;
       target.hp -= 1;
       if (target.hp <= 0) respawnPlayer(target);
       syncUi();
@@ -268,10 +278,12 @@ function Index() {
       return true;
     };
 
+    // Every tile — including the initial bridge — is stored in the unified
+    // grid and can be removed by index assignment (splice-equivalent for a 2D array).
     const breakAt = (p: Player, col: number, row: number) => {
       if (col < 0 || col >= COLS || row < 0 || row >= ROWS) return false;
       const t = grid[row][col];
-      if (t !== PLACED_RED && t !== PLACED_BLUE) return false;
+      if (t === AIR) return false;
       grid[row][col] = AIR;
       if (t === p.placedTile) p.blocksLeft = Math.min(MAX_BLOCKS, p.blocksLeft + 1);
       syncUi();
@@ -279,7 +291,6 @@ function Index() {
     };
 
     const placeFront = (p: Player) => {
-      // try 1 tile ahead, else 2
       const f1 = frontTile(p, 1);
       if (placeAt(p, f1.col, f1.row)) return;
       const f2 = frontTile(p, 2);
@@ -293,21 +304,25 @@ function Index() {
       breakAt(p, f2.col, f2.row);
     };
 
-    const swingHitbox = (p: Player) => {
-      const x = p.facing === 1 ? p.x + p.w : p.x - SWING_REACH;
-      return { x, y: p.y + 4, w: SWING_REACH, h: p.h - 8 };
-    };
-
+    // Instant, vector-based hit detection — runs the frame the key is pressed.
+    // The visual arc (drawn separately) takes 0.2s but mechanics resolve NOW.
     const attack = (p: Player) => {
       const now = performance.now();
       if (now < p.swingReadyAt) return;
       p.swingUntil = now + SWING_DURATION;
       p.swingReadyAt = now + SWING_COOLDOWN;
-      const hb = swingHitbox(p);
+      const acx = p.x + p.w / 2;
+      const acy = p.y + p.h / 2;
       for (const other of players) {
         if (other.id === p.id) continue;
-        if (rectsOverlap(hb.x, hb.y, hb.w, hb.h, other.x, other.y, other.w, other.h)) {
-          damage(other, p.facing);
+        const ocx = other.x + other.w / 2;
+        const ocy = other.y + other.h / 2;
+        const dx = ocx - acx;
+        const dy = ocy - acy;
+        // 3-block radius arc — semicircle sweeps behind → over head → in front,
+        // which in practice covers the full circle around the attacker.
+        if (dx * dx + dy * dy <= SWING_RADIUS * SWING_RADIUS) {
+          damageVector(other, dx, dy);
         }
       }
     };
