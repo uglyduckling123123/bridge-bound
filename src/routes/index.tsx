@@ -442,98 +442,350 @@ function Index() {
       }
     };
 
-    // ---------- Bot AI ----------
-    const bot = {
-      moveLeft: false,
-      moveRight: false,
-      wantJump: false,
-      nextActionAt: 0,
-      nextShotAt: 0,
+    // ---------- Bot AI: perception buffer + state machine ----------
+    type Snapshot = {
+      redX: number;
+      redY: number;
+      grid: number[][];
+      timestamp: number;
+    };
+    const gameStateHistory: Snapshot[] = [];
+    const HISTORY_MAX_AGE = 1500; // prune > 1.5s
+    const PERCEPTION_DELAY = 500; // 500ms reaction lag
+
+    const pushHistory = (nowMs: number) => {
+      // Deep-copy the grid so mutations don't leak backwards through history.
+      const snap: Snapshot = {
+        redX: players[0].x,
+        redY: players[0].y,
+        grid: grid.map((row) => row.slice()),
+        timestamp: nowMs,
+      };
+      gameStateHistory.push(snap);
+      const cutoff = nowMs - HISTORY_MAX_AGE;
+      while (gameStateHistory.length > 0 && gameStateHistory[0].timestamp < cutoff) {
+        gameStateHistory.shift();
+      }
     };
 
-    const updateBot = (now: number) => {
+    const getDelayedPerception = (nowMs: number) => {
+      const targetTs = nowMs - PERCEPTION_DELAY;
+      // Newest snapshot with timestamp <= targetTs
+      let chosen: Snapshot | null = null;
+      for (let i = gameStateHistory.length - 1; i >= 0; i--) {
+        if (gameStateHistory[i].timestamp <= targetTs) {
+          chosen = gameStateHistory[i];
+          break;
+        }
+      }
+      // Null-safety: fall back to Red's live coordinates + live grid.
+      if (!chosen) {
+        return { delayedRedX: players[0].x, delayedRedY: players[0].y, delayedGrid: grid };
+      }
+      return { delayedRedX: chosen.redX, delayedRedY: chosen.redY, delayedGrid: chosen.grid };
+    };
+
+    enum BotState {
+      RACE = "RACE",
+      INTERCEPT = "INTERCEPT",
+      DEFENSE = "DEFENSE",
+      SABOTAGE = "SABOTAGE",
+      PILLAR = "PILLAR",
+      VOID_RECOVERY = "VOID_RECOVERY",
+    }
+
+    const bot = {
+      currentState: BotState.INTERCEPT,
+      nextEvalAt: 0,
+      nextActionAt: 0,
+      nextShotAt: 0,
+      prevVy: 0,
+      pillarJumpArmed: false,
+      // Delayed perception exposed to executors:
+      delayedRedX: 0,
+      delayedRedY: 0,
+      delayedGrid: grid,
+    };
+
+    const EVAL_INTERVAL = 500; // 0.5s decision cadence
+
+    const BRIDGE_Y = BRIDGE_ROW * TILE;
+    const RED_GOAL_X = RED_GOAL.col * TILE;
+    const BLUE_GOAL_X = BLUE_GOAL.col * TILE;
+
+    const isBotSolid = (g: number[][], col: number, row: number) => {
+      if (row < 0 || row >= ROWS || col < 0 || col >= COLS) return false;
+      const t = g[row][col];
+      return t === BLOCK || t === PLACED_RED || t === PLACED_BLUE;
+    };
+    const isEnemyBlock = (t: number) => t === PLACED_RED;
+    const isPlacedTile = (t: number) => t === PLACED_RED || t === PLACED_BLUE;
+
+    const pathBlockedByEnemy = (fromX: number, toX: number, y: number, g: number[][]) => {
+      const r = Math.floor((y + players[1].h / 2) / TILE);
+      const c1 = Math.floor(Math.min(fromX, toX) / TILE);
+      const c2 = Math.floor(Math.max(fromX, toX) / TILE);
+      for (let c = c1; c <= c2; c++) {
+        if (isEnemyBlock(g[r]?.[c] ?? AIR)) return true;
+      }
+      return false;
+    };
+
+    const redSupportedByPlacedOverVoid = (rx: number, ry: number, g: number[][]) => {
+      const col = Math.floor((rx + players[0].w / 2) / TILE);
+      const feetRow = Math.floor((ry + players[0].h) / TILE);
+      const under = g[feetRow]?.[col] ?? AIR;
+      if (!isPlacedTile(under)) return false;
+      // Is there void beneath the placed block(s)? Scan a few rows down.
+      for (let r = feetRow + 1; r < ROWS; r++) {
+        if (g[r][col] === BLOCK) return false; // real bridge under → not floating
+        if (g[r][col] === AIR) return true;
+      }
+      return true;
+    };
+
+    const evaluateState = (nowMs: number): BotState => {
+      const me = players[1];
+      const { delayedRedX, delayedRedY, delayedGrid } = bot;
+
+      // STATE A is evaluated every frame separately — skipped here.
+
+      // STATE B: pillaring / elevation matching
+      const heightDiff = me.y - delayedRedY; // positive means red is higher
+      const horizProxToRed = Math.abs(delayedRedX - me.x);
+      if (heightDiff > TILE * 1.2 && horizProxToRed < TILE * 3) {
+        return BotState.PILLAR;
+      }
+
+      const botDistToTarget = Math.abs(me.x - RED_GOAL_X);
+      const redDistToTarget = Math.abs(delayedRedX - BLUE_GOAL_X);
+
+      // STATE C: defense — red is closer to scoring than we are to ours
+      if (redDistToTarget < botDistToTarget - 8) {
+        return BotState.DEFENSE;
+      }
+
+      // STATE D: path sabotage
+      const redAtBridgeLevel = Math.abs(delayedRedY - (BRIDGE_ROW - 2) * TILE) < TILE * 1.5;
+      if (redAtBridgeLevel && redSupportedByPlacedOverVoid(delayedRedX, delayedRedY, delayedGrid)) {
+        return BotState.SABOTAGE;
+      }
+
+      // STATE E: racing — we're closer and path is clear of enemy blocks
+      if (
+        botDistToTarget < redDistToTarget &&
+        !pathBlockedByEnemy(me.x, RED_GOAL_X, me.y, delayedGrid)
+      ) {
+        return BotState.RACE;
+      }
+
+      // STATE F: fallback intercept & combat
+      return BotState.INTERCEPT;
+      void nowMs;
+    };
+
+    // ---- executors: run every frame for fluid movement ----
+    const moveTowards = (targetX: number) => {
+      const me = players[1];
+      const dx = targetX - (me.x + me.w / 2);
+      if (Math.abs(dx) < 4) { me.vx = 0; return; }
+      if (dx > 0) { me.vx = MOVE_SPEED; me.facing = 1; }
+      else { me.vx = -MOVE_SPEED; me.facing = -1; }
+    };
+
+    const jumpIfGrounded = () => {
+      const me = players[1];
+      if (me.onGround) { me.vy = -JUMP_V; me.onGround = false; }
+    };
+
+    const clearForwardObstacles = (nowMs: number) => {
+      const me = players[1];
+      const dir = me.facing;
+      const cx = Math.floor((me.x + me.w / 2) / TILE);
+      const feetRow = Math.floor((me.y + me.h - 1) / TILE);
+      const headRow = Math.floor(me.y / TILE);
+      const aheadCol = cx + dir;
+      if (aheadCol < 0 || aheadCol >= COLS) return;
+      const groundAhead = isSolid(aheadCol, feetRow + 1);
+      const headBlocked = isSolid(aheadCol, headRow);
+      const bodyBlocked = isSolid(aheadCol, feetRow);
+
+      if ((headBlocked || bodyBlocked) && nowMs >= bot.nextActionAt) {
+        const oldFacing = me.facing;
+        me.facing = dir as 1 | -1;
+        breakFront(me);
+        me.facing = oldFacing;
+        bot.nextActionAt = nowMs + 220;
+        return;
+      }
+      // Smart bridging: void ahead → briefly halt and place under the gap
+      if (!groundAhead && me.onGround && me.blocksLeft > 0 && nowMs >= bot.nextActionAt) {
+        me.vx = 0;
+        placeAt(me, aheadCol, feetRow + 1);
+        bot.nextActionAt = nowMs + 180;
+      }
+    };
+
+    // STATE A executor — checked every frame for clutch saves
+    const tryVoidRecovery = (nowMs: number): boolean => {
+      const me = players[1];
+      const belowBridge = me.y > BRIDGE_Y + TILE * 0.5;
+      const falling = me.vy > 0;
+      if (!(belowBridge && falling)) return false;
+      // Snap horizontal momentum toward nearest solid structure horizontally.
+      // Pick left/right based on which side has a nearer solid column at bridge row.
+      let nearestDx = 0;
+      for (let d = 1; d < COLS; d++) {
+        const cL = Math.floor((me.x + me.w / 2) / TILE) - d;
+        const cR = Math.floor((me.x + me.w / 2) / TILE) + d;
+        if (cL >= 0 && isSolid(cL, BRIDGE_ROW)) { nearestDx = -1; break; }
+        if (cR < COLS && isSolid(cR, BRIDGE_ROW)) { nearestDx = 1; break; }
+      }
+      if (nearestDx !== 0) {
+        me.vx = MOVE_SPEED * nearestDx;
+        me.facing = nearestDx as 1 | -1;
+      }
+      // Place a platform directly beneath our feet to arrest the fall.
+      if (me.blocksLeft > 0 && nowMs >= bot.nextActionAt) {
+        const col = Math.floor((me.x + me.w / 2) / TILE);
+        const row = Math.floor((me.y + me.h) / TILE);
+        if (placeAt(me, col, row)) {
+          bot.nextActionAt = nowMs + 150;
+        }
+      }
+      return true;
+    };
+
+    const executePillar = (nowMs: number) => {
+      const me = players[1];
+      moveTowards(me.x + me.w / 2); // stay in place horizontally
+      me.vx = 0;
+      if (me.onGround) {
+        jumpIfGrounded();
+        bot.pillarJumpArmed = true;
+      }
+      // Detect the peak: vy transitions from negative toward >= 0.
+      const atPeak = bot.pillarJumpArmed && bot.prevVy < 0 && me.vy >= -0.2;
+      if (atPeak && me.blocksLeft > 0 && nowMs >= bot.nextActionAt) {
+        const col = Math.floor((me.x + me.w / 2) / TILE);
+        const row = Math.floor((me.y + me.h) / TILE) + 1;
+        if (placeAt(me, col, row)) bot.nextActionAt = nowMs + 200;
+        bot.pillarJumpArmed = false;
+      }
+    };
+
+    const executeDefense = (nowMs: number) => {
+      const me = players[1];
+      moveTowards(BLUE_GOAL_X);
+      clearForwardObstacles(nowMs);
+      // Blockade: if we're ahead of red (between red and blue goal), wall up.
+      const meAhead = Math.abs(me.x - BLUE_GOAL_X) < Math.abs(bot.delayedRedX - BLUE_GOAL_X) - TILE;
+      if (meAhead && me.onGround && me.blocksLeft >= 2 && nowMs >= bot.nextActionAt) {
+        // Face the incoming red
+        me.facing = bot.delayedRedX > me.x ? 1 : -1;
+        const cx = Math.floor((me.x + me.w / 2) / TILE);
+        const feetRow = Math.floor((me.y + me.h - 1) / TILE);
+        const col = cx + me.facing;
+        const okLow = placeAt(me, col, feetRow);
+        const okHigh = placeAt(me, col, feetRow - 1);
+        if (okLow || okHigh) bot.nextActionAt = nowMs + 260;
+        // Then smoothly hop over our own wall
+        jumpIfGrounded();
+      }
+    };
+
+    const executeSabotage = (nowMs: number) => {
+      const me = players[1];
+      // Move under the block supporting the delayed red position.
+      const targetCol = Math.floor((bot.delayedRedX + players[0].w / 2) / TILE);
+      const targetX = targetCol * TILE + TILE / 2;
+      moveTowards(targetX);
+      clearForwardObstacles(nowMs);
+      // Break the specific block directly beneath the delayed opponent.
+      const feetRow = Math.floor((bot.delayedRedY + players[0].h) / TILE);
+      if (nowMs >= bot.nextActionAt && isPlacedTile(grid[feetRow]?.[targetCol] ?? AIR)) {
+        breakAt(me, targetCol, feetRow);
+        bot.nextActionAt = nowMs + 180;
+      }
+    };
+
+    const executeRace = (nowMs: number) => {
+      moveTowards(RED_GOAL_X);
+      clearForwardObstacles(nowMs);
+    };
+
+    const executeIntercept = (nowMs: number) => {
       const me = players[1];
       const foe = players[0];
-      bot.moveLeft = false; bot.moveRight = false; bot.wantJump = false;
+      const horizDelayed = bot.delayedRedX - me.x;
+      me.facing = horizDelayed >= 0 ? 1 : -1;
 
-      const defensive = me.hp <= 1;
-      const targetX = defensive
-        ? (BLUE_GOAL.col + 1) * TILE
-        : foe.x; // seek foe / red goal (foe often near red goal)
-      const dx = targetX - me.x;
-      const absDx = Math.abs(dx);
-
-      // Facing towards foe for combat
-      const foeDx = foe.x - me.x;
-      me.facing = foeDx >= 0 ? 1 : -1;
-
-      // Melee if close
-      const meleeDist = 40;
-      if (Math.abs(foeDx) < meleeDist && Math.abs(foe.y - me.y) < 40) {
+      // Melee (uses live foe for real hit resolution; facing was set from delayed x)
+      const meleeDist = TILE * 1.2;
+      if (Math.abs(foe.x - me.x) < meleeDist && Math.abs(foe.y - me.y) < TILE * 1.4) {
         attack(me);
       }
 
-      // Move towards target
-      if (absDx > 8) {
-        if (dx > 0) bot.moveRight = true; else bot.moveLeft = true;
+      // Ranged
+      const yAligned = Math.abs(bot.delayedRedY - me.y) < TILE * 1.5;
+      const longRange = Math.abs(horizDelayed) > TILE * 4;
+      if (yAligned && longRange && me.arrows > 0 && nowMs >= bot.nextShotAt) {
+        // Upward angle compensation for gravity drop.
+        const dist = Math.abs(horizDelayed);
+        const comp = Math.min(0.5, 0.05 + dist / (TILE * 40));
+        fireArrow(me, comp);
+        bot.nextShotAt = nowMs + 850;
       }
 
-      // Check ahead: gap or block?
-      const cx = Math.floor((me.x + me.w / 2) / TILE);
-      const cy = Math.floor((me.y + me.h / 2) / TILE);
-      const dir = defensive ? (me.x > (BLUE_GOAL.col + 1) * TILE ? -1 : 1) : (dx >= 0 ? 1 : -1);
-      const aheadCol = cx + dir;
-      const feetRow = Math.floor((me.y + me.h) / TILE);
-
-      if (me.onGround && aheadCol >= 0 && aheadCol < COLS) {
-        const aheadBlock = grid[feetRow - 1]?.[aheadCol];
-        const groundAhead = isSolid(aheadCol, feetRow);
-        // Block in path at body height -> break or jump
-        if (aheadBlock === PLACED_RED || aheadBlock === PLACED_BLUE) {
-          if (now >= bot.nextActionAt) {
-            const oldFacing = me.facing;
-            me.facing = dir as 1 | -1;
-            breakFront(me);
-            me.facing = oldFacing;
-            bot.nextActionAt = now + 300;
-          }
-        } else if (!groundAhead) {
-          // Gap ahead: place a block to bridge
-          if (now >= bot.nextActionAt && me.blocksLeft > 0) {
-            const oldFacing = me.facing;
-            me.facing = dir as 1 | -1;
-            // Place on the ground row where we need footing
-            placeAt(me, aheadCol, feetRow);
-            me.facing = oldFacing;
-            bot.nextActionAt = now + 250;
-          } else {
-            bot.wantJump = true;
-          }
-        }
-      }
-
-      // Bow: if lined up horizontally and far, shoot
-      const verticallyAligned = Math.abs(foe.y - me.y) < 30;
-      const farEnough = Math.abs(foeDx) > 120;
-      if (verticallyAligned && farEnough && me.arrows > 0 && now >= bot.nextShotAt) {
-        // Aim roughly flat
-        const ang = 0.1;
-        fireArrow(me, ang);
-        bot.nextShotAt = now + 900;
-      }
-
-      // Apply movement
-      if (bot.moveLeft) { me.vx = -MOVE_SPEED; }
-      else if (bot.moveRight) { me.vx = MOVE_SPEED; }
-      else { me.vx = 0; }
-      if (bot.wantJump && me.onGround) { me.vy = -JUMP_V; me.onGround = false; }
+      // Approach target while clearing obstacles.
+      moveTowards(bot.delayedRedX);
+      clearForwardObstacles(nowMs);
     };
+
+    const updateBot = (nowMs: number) => {
+      const me = players[1];
+
+      // Refresh delayed perception once per tick.
+      const { delayedRedX, delayedRedY, delayedGrid } = getDelayedPerception(Date.now());
+      bot.delayedRedX = delayedRedX;
+      bot.delayedRedY = delayedRedY;
+      bot.delayedGrid = delayedGrid;
+
+      // STATE A always evaluated first, every frame — clutch save bypass.
+      if (tryVoidRecovery(nowMs)) {
+        bot.currentState = BotState.VOID_RECOVERY;
+        bot.prevVy = me.vy;
+        return;
+      }
+
+      // Evaluate remaining states on a 0.5s cadence to avoid jitter.
+      if (nowMs >= bot.nextEvalAt) {
+        bot.currentState = evaluateState(nowMs);
+        bot.nextEvalAt = nowMs + EVAL_INTERVAL;
+      }
+
+      // Execute the chosen state every frame for fluid behavior.
+      switch (bot.currentState) {
+        case BotState.PILLAR:    executePillar(nowMs); break;
+        case BotState.DEFENSE:   executeDefense(nowMs); break;
+        case BotState.SABOTAGE:  executeSabotage(nowMs); break;
+        case BotState.RACE:      executeRace(nowMs); break;
+        case BotState.INTERCEPT:
+        default:                 executeIntercept(nowMs); break;
+      }
+
+      bot.prevVy = me.vy;
+    };
+
 
     let raf = 0;
     const loop = () => {
       const now = performance.now();
 
       if (!gameOver) {
+        // Perception buffer: snapshot BEFORE any per-frame simulation so the
+        // bot's delayed lookup always sees a stable, past-tense world state.
+        if (botMode) pushHistory(Date.now());
         // -------- Frame-loop input: evaluate direct flags FIRST --------
         // Doing this at the top of the tick guarantees no dropped or delayed
         // inputs — every held key is checked exactly once per frame.
