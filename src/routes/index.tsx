@@ -601,7 +601,7 @@ function Index() {
       if (me.vx < -MOVE_TERMINAL) me.vx = -MOVE_TERMINAL;
     };
 
-    // Smart obstacle handling: jump over low walls, mine if blocked
+    // Smart obstacle handling: 1 block per frame, immediate return after action
     const clearForwardObstacles = (nowMs: number) => {
       const me = players[1];
       const dir = me.facing;
@@ -615,65 +615,42 @@ function Index() {
       const headBlocked = isSolid(aheadCol, headRow);
       const bodyBlocked = isSolid(aheadCol, feetRow);
 
-      // Check for wall that's jumpable (<= 2 blocks high with clear overhead)
+      // Blocked by wall - check if jumpable (no loop, single check for 2-block clearance)
       if ((headBlocked || bodyBlocked) && me.onGround) {
-        // Scan above the wall to see if we can jump over
-        let wallHeight = 0;
-        let canJumpOver = true;
-        const maxJumpClear = 2; // can jump over 2-block-high walls
+        // Quick jump check: if head NOT blocked and 2 rows above both clear, jump
+        const rowAboveHead = headRow - 1;
+        const rowTwoAbove = headRow - 2;
+        const canJumpOver = !headBlocked &&
+          rowAboveHead >= 0 && rowTwoAbove >= 0 &&
+          !isSolid(aheadCol, rowAboveHead) && !isSolid(aheadCol, rowTwoAbove);
 
-        for (let h = 0; h < maxJumpClear + 1; h++) {
-          const checkRow = feetRow - h;
-          if (checkRow < 0) { canJumpOver = false; break; }
-          if (isSolid(aheadCol, checkRow)) {
-            wallHeight++;
-          } else {
-            // Found air, check if there's enough clearance above (2 blocks)
-            const clearanceRow1 = checkRow - 1;
-            const clearanceRow2 = checkRow - 2;
-            if (clearanceRow1 < 0 || clearanceRow2 < 0) {
-              canJumpOver = false;
-            } else if (isSolid(aheadCol, clearanceRow1) || isSolid(aheadCol, clearanceRow2)) {
-              canJumpOver = false; // ceiling blocks jump
-            }
-            break;
-          }
-        }
-
-        // If wall is <= 2 blocks high and clear overhead, try to jump
-        if (canJumpOver && wallHeight <= maxJumpClear && wallHeight > 0) {
-          // Check if we're stuck (1.5s timeout)
-          const stuckTooLong = nowMs >= bot.jumpAttemptStart + 1500;
+        // Check if we're stuck (1.5s timeout)
+        const stuckTooLong = nowMs >= bot.jumpAttemptStart + 1500;
+        if (canJumpOver && !stuckTooLong) {
           if (!bot.jumpAttemptStart) bot.jumpAttemptStart = nowMs;
-
-          if (!stuckTooLong) {
-            // Execute forward jump
-            me.vy = -JUMP_V;
-            me.onGround = false;
-            // Maintain forward momentum
-            if (dir > 0) me.vx = Math.max(me.vx, MOVE_SPEED);
-            else me.vx = Math.min(me.vx, -MOVE_SPEED);
-            bot.jumpAttemptStart = 0; // reset on successful jump
-            return { cleared: false, bridged: false, jumping: true };
-          }
-          // Fall through to mining if stuck too long
+          // Execute forward jump
+          me.vy = -JUMP_V;
+          me.onGround = false;
+          if (dir > 0) me.vx = Math.max(me.vx, MOVE_SPEED);
+          else me.vx = Math.min(me.vx, -MOVE_SPEED);
+          bot.jumpAttemptStart = 0;
+          return { cleared: false, bridged: false, jumping: true };
         }
-
-        // Sequential break: first head level, then foot level to clear 2-block-high passage
+        // Timeout or can't jump - mine ONE block, return immediately
         if (nowMs >= bot.nextActionAt) {
+          // Priority: head block first, then body block (single action per frame)
           if (headBlocked) {
             breakAt(me, aheadCol, headRow);
-            bot.nextActionAt = nowMs + 180;
           } else if (bodyBlocked) {
             breakAt(me, aheadCol, feetRow);
-            bot.nextActionAt = nowMs + 180;
           }
-          bot.jumpAttemptStart = 0; // reset timeout tracking
+          bot.nextActionAt = nowMs + 180;
+          bot.jumpAttemptStart = 0;
           return { cleared: true, bridged: false, jumping: false };
         }
       }
 
-      // Smart bridging: void ahead → briefly halt, place block, resume movement
+      // Smart bridging: void ahead → place block, return immediately
       if (!groundAhead && me.onGround && me.blocksLeft > 0 && nowMs >= bot.nextActionAt) {
         me.vx = 0;
         if (placeAt(me, aheadCol, feetRow + 1)) {
@@ -684,26 +661,19 @@ function Index() {
       return { cleared: false, bridged: false, jumping: false };
     };
 
-    // STATE A executor — checked every frame for clutch saves
+    // STATE A executor — single action per frame, no loops
     const tryVoidRecovery = (nowMs: number): boolean => {
       const me = players[1];
       const belowBridge = me.y > BRIDGE_Y + TILE * 0.5;
       const falling = me.vy > 0;
       if (!(belowBridge && falling)) return false;
-      // Snap horizontal momentum toward nearest solid structure horizontally.
-      // Pick left/right based on which side has a nearer solid column at bridge row.
-      let nearestDx = 0;
-      for (let d = 1; d < COLS; d++) {
-        const cL = Math.floor((me.x + me.w / 2) / TILE) - d;
-        const cR = Math.floor((me.x + me.w / 2) / TILE) + d;
-        if (cL >= 0 && isSolid(cL, BRIDGE_ROW)) { nearestDx = -1; break; }
-        if (cR < COLS && isSolid(cR, BRIDGE_ROW)) { nearestDx = 1; break; }
-      }
-      if (nearestDx !== 0) {
-        me.vx = MOVE_SPEED * nearestDx;
-        me.facing = nearestDx as 1 | -1;
-      }
-      // Place a platform directly beneath our feet to arrest the fall.
+      // Push toward bridge row direction based on current column (no scan loop)
+      const myCol = Math.floor((me.x + me.w / 2) / TILE);
+      const centerCol = Math.floor(COLS / 2);
+      const towardCenter = myCol < centerCol ? 1 : -1;
+      me.vx = MOVE_SPEED * towardCenter;
+      me.facing = towardCenter as 1 | -1;
+      // Place platform directly beneath feet - single action per frame
       if (me.blocksLeft > 0 && nowMs >= bot.nextActionAt) {
         const col = Math.floor((me.x + me.w / 2) / TILE);
         const row = Math.floor((me.y + me.h) / TILE);
