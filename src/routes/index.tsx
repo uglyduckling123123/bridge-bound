@@ -746,7 +746,7 @@ function Index() {
       const me = players[1];
 
       // Refresh delayed perception once per tick.
-      const { delayedRedX, delayedRedY, delayedGrid } = getDelayedPerception(nowMs);
+      const { delayedRedX, delayedRedY, delayedGrid } = getDelayedPerception(Date.now());
       bot.delayedRedX = delayedRedX;
       bot.delayedRedY = delayedRedY;
       bot.delayedGrid = delayedGrid;
