@@ -576,7 +576,7 @@ function Index() {
           for (const p of players) {
             if (p.id === a.owner) continue;
             if (a.x >= p.x && a.x <= p.x + p.w && a.y >= p.y && a.y <= p.y + p.h) {
-              damage(p, a.vx >= 0 ? 1 : -1);
+              damageVector(p, a.vx, a.vy);
               a.alive = false;
               break;
             }
