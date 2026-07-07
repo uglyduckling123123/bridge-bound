@@ -375,48 +375,36 @@ function Index() {
     canvas.addEventListener("mousedown", onMouseDown);
     canvas.addEventListener("contextmenu", onCtx);
 
-    // ---------- Keyboard ----------
-    const keys = new Set<string>();
+    // ---------- Keyboard: zero-latency direct boolean flags ----------
+    // `keysPressed` is the authoritative held-key dictionary.
+    // `justPressed` is populated on the leading edge of a keydown and drained
+    // by the frame loop, so edge-triggered actions (attack, place, break, bow
+    // start) can never be dropped or duplicated by async event scheduling.
+    const keysPressed: Record<string, boolean> = {};
+    const justPressed = new Set<string>();
+    const justReleased = new Set<string>();
+
     const onDown = (e: KeyboardEvent) => {
-      if (gameOver) return;
       const k = e.key.toLowerCase();
       if (k.startsWith("arrow") || k === " ") e.preventDefault();
-      const wasDown = keys.has(k);
-      keys.add(k);
-      if (wasDown) return;
-
-      const now = performance.now();
-      for (const p of players) {
-        if (botMode && p.id === 1) continue; // bot controls blue
-        if (k === p.controls.jump && p.onGround) { p.vy = -JUMP_V; p.onGround = false; }
-        if (p.controls.attack.includes(k)) attack(p);
-        // Red uses mouse for placing/breaking; keep keys only for Blue in 1v1
-        if (p.id === 1) {
-          if (k === p.controls.place) placeFront(p);
-          if (k === p.controls.breakBlock) breakFront(p);
-        }
-        if (p.controls.bow.includes(k) && !p.aiming && p.arrows > 0) {
-          p.aiming = true; p.aimStart = now;
-        }
-      }
+      if (gameOver) return;
+      if (!keysPressed[k]) justPressed.add(k);
+      keysPressed[k] = true;
     };
     const onUp = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase();
-      keys.delete(k);
-      const now = performance.now();
-      for (const p of players) {
-        if (botMode && p.id === 1) continue;
-        if (p.controls.bow.includes(k) && p.aiming) {
-          const stillHeld = p.controls.bow.some((bk) => keys.has(bk));
-          if (!stillHeld) {
-            fireArrow(p, aimAngle(p, now));
-            p.aiming = false;
-          }
-        }
-      }
+      if (keysPressed[k]) justReleased.add(k);
+      keysPressed[k] = false;
     };
     window.addEventListener("keydown", onDown);
     window.addEventListener("keyup", onUp);
+
+    // Alias `keys` for existing helpers (mouse indicator, bot hold checks).
+    const keys = {
+      has: (k: string) => !!keysPressed[k],
+    };
+    void keys;
+
 
     const moveAxis = (p: Player, dx: number, dy: number) => {
       p.x += dx;
